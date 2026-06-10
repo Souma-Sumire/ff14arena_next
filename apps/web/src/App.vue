@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import type { InputHTMLAttributes } from 'vue';
 import {
   computed,
   defineAsyncComponent,
@@ -13,6 +14,7 @@ import type { GlobalThemeOverrides, SelectOption } from 'naive-ui';
 import {
   darkTheme,
   dateZhCN,
+  createDiscreteApi,
   NAlert,
   NButton,
   NConfigProvider,
@@ -20,6 +22,7 @@ import {
   NInput,
   NModal,
   NSpace,
+  NSwitch,
   zhCN,
 } from 'naive-ui';
 import AppTopbar from './components/layout/AppTopbar.vue';
@@ -42,6 +45,19 @@ const BattlePage = defineAsyncComponent(() => import('./components/pages/BattleP
 const ServerMetricsPage = defineAsyncComponent(
   () => import('./components/pages/ServerMetricsPage.vue'),
 );
+
+const userNameInputProps: InputHTMLAttributes = {
+  id: 'ff14arena-user-name',
+  name: 'ff14arena-user-name',
+  autocomplete: 'nickname',
+};
+
+const serverUrlInputProps: InputHTMLAttributes = {
+  id: 'ff14arena-server-url',
+  name: 'ff14arena-server-url',
+  autocomplete: 'off',
+  inputmode: 'url',
+};
 
 const MIN_CAMERA_ZOOM = 0.7;
 const MAX_CAMERA_ZOOM = 2.4;
@@ -84,6 +100,15 @@ const themeOverrides: GlobalThemeOverrides = {
 };
 
 const store = useAppStore();
+
+// 在 App 级别创建 message API，避免 store 内部 createDiscreteApi 缺少 message provider
+const { message } = createDiscreteApi(['message'], {
+  configProviderProps: {
+    theme: darkTheme,
+  },
+});
+store.setMessageApi(message);
+
 const {
   profile,
   battles,
@@ -112,10 +137,17 @@ const editUserName = ref(profile.value.userName);
 const operationMode = ref<OperationMode>(loadOperationMode());
 const cameraYaw = ref(0);
 const cameraZoom = ref(1);
-const startCountdownSeconds = ref(5);
+const startCountdownSeconds = ref(3);
 const startTimeSeconds = ref(0);
 const roomPasswordInput = ref('');
-const isMetricsRoute = window.location.pathname === '/metrics';
+const isMetricsRoute = ref(
+  window.location.pathname === '/metrics' || window.location.hash === '#/metrics',
+);
+
+function handleHashChange(): void {
+  isMetricsRoute.value =
+    window.location.pathname === '/metrics' || window.location.hash === '#/metrics';
+}
 const lastTraditionalFacing = ref<number | null>(null);
 const pendingPointerFacing = ref<number | null>(null);
 const lastSentPointerFacing = ref<number | null>(null);
@@ -123,6 +155,22 @@ const appVersionConfig = ref<AppVersionConfig | null>(null);
 const pendingChangelogEntries = ref<AppChangelogEntry[]>([]);
 const changelogModalVisible = ref(false);
 const pressedKeys = new Set<string>();
+
+watch(connected, async (isConnected) => {
+  if (isConnected) {
+    await refreshLobby();
+  }
+});
+
+watch(
+  battles,
+  (newBattles) => {
+    if (createBattleId.value === '' && newBattles[0] !== undefined) {
+      createBattleId.value = newBattles[0].id;
+    }
+  },
+  { immediate: true },
+);
 
 const battleOptions = computed<SelectOption[]>(() =>
   battles.value.map((battle) => ({
@@ -144,7 +192,8 @@ const canStart = computed(() => {
     return false;
   }
 
-  return room.value.battleId !== null && room.value.startCountdown === null;
+  const hasEmptySlot = room.value.slots.some((slot) => slot.occupantType === 'empty');
+  return room.value.battleId !== null && room.value.startCountdown === null && !hasEmptySlot;
 });
 const latestResult = computed(
   () => snapshot.value?.latestResult ?? room.value?.latestResult ?? null,
@@ -237,9 +286,6 @@ function selectBattleByValue(value: SelectValue): void {
 async function refreshLobby(): Promise<void> {
   try {
     await store.loadLobbyData();
-    if (createBattleId.value === '' && battles.value[0] !== undefined) {
-      createBattleId.value = battles.value[0].id;
-    }
   } catch (error) {
     console.error(error);
   }
@@ -277,7 +323,7 @@ function cancelRoomPasswordPrompt(): void {
 }
 
 function openMetricsPage(): void {
-  window.location.assign('/metrics');
+  window.location.hash = '#/metrics';
 }
 
 async function checkAppVersion(): Promise<void> {
@@ -458,7 +504,7 @@ watch(
 );
 
 onMounted(async () => {
-  if (isMetricsRoute) {
+  if (isMetricsRoute.value) {
     return;
   }
 
@@ -468,6 +514,7 @@ onMounted(async () => {
   window.addEventListener('keyup', handleKeyUp);
   window.addEventListener('blur', handleWindowBlur);
   document.addEventListener('visibilitychange', handleVisibilityChange);
+  window.addEventListener('hashchange', handleHashChange);
 
   await nextTick();
 
@@ -519,6 +566,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keyup', handleKeyUp);
   window.removeEventListener('blur', handleWindowBlur);
   document.removeEventListener('visibilitychange', handleVisibilityChange);
+  window.removeEventListener('hashchange', handleHashChange);
   clearKeyboardInputState();
 
   if (movementTimer !== null) {
@@ -540,153 +588,166 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-else class="shell">
-      <AppTopbar
-        :connected="connected"
-        :latency-display="latencyDisplay"
-        :user-name="profile.userName"
-        :room-name="room?.name ?? null"
-        :room-phase="roomPhaseLabel"
-        :battle-name="snapshot?.battleName ?? room?.battleName ?? null"
-        :is-owner="isOwner"
-        :battle-options="battleOptions"
-        :room-battle-id="room?.battleId ?? null"
-        :battle-select-disabled="!isOwner || snapshot?.phase !== 'waiting'"
-        @select-battle="selectBattleByValue"
-        @leave-room="store.leaveRoom"
-        @open-metrics="openMetricsPage"
-      />
+        <AppTopbar
+          :connected="connected"
+          :latency-display="latencyDisplay"
+          :user-name="profile.userName"
+          :room-name="room?.name ?? null"
+          :room-phase="roomPhaseLabel"
+          :battle-name="snapshot?.battleName ?? room?.battleName ?? null"
+          :is-owner="isOwner"
+          :battle-options="battleOptions"
+          :room-battle-id="room?.battleId ?? null"
+          :battle-select-disabled="!isOwner || snapshot?.phase !== 'waiting'"
+          @select-battle="selectBattleByValue"
+          @leave-room="store.leaveRoom"
+          @open-metrics="openMetricsPage"
+          @edit-user-name="
+            (name) => {
+              editUserName = name;
+              store.updateProfile(name);
+            }
+          "
+        />
 
-      <main :class="['shell-content', page === 'battle' ? 'battle-content' : 'home-content']">
-        <n-alert v-if="serverError" type="error" :show-icon="false" closable class="content-alert">
-          {{ serverError }}
-        </n-alert>
-        <n-alert
-          v-if="statusIconPreloadError"
-          type="error"
-          :show-icon="false"
-          closable
-          class="content-alert"
-        >
-          {{ statusIconPreloadError }}
-        </n-alert>
+        <main :class="['shell-content', page === 'battle' ? 'battle-content' : 'home-content']">
+          <n-alert
+            v-if="serverError"
+            type="error"
+            :show-icon="false"
+            closable
+            class="content-alert"
+          >
+            {{ serverError }}
+          </n-alert>
+          <n-alert
+            v-if="statusIconPreloadError"
+            type="error"
+            :show-icon="false"
+            closable
+            class="content-alert"
+          >
+            {{ statusIconPreloadError }}
+          </n-alert>
 
-        <n-modal
-          :show="roomPasswordPromptVisible"
-          preset="dialog"
-          title="房间密码"
-          :mask-closable="false"
-          @close="cancelRoomPasswordPrompt"
-        >
-          <n-space vertical :size="12">
-            <span>{{ roomPasswordPromptMessage }}</span>
-            <n-input
-              v-model:value="roomPasswordInput"
-              type="password"
-              show-password-on="click"
-              autofocus
-              placeholder="输入房间密码"
-              @keyup.enter="submitRoomPasswordPrompt"
-            />
-            <n-space justify="end">
-              <n-button secondary @click="cancelRoomPasswordPrompt">取消</n-button>
-              <n-button type="primary" @click="submitRoomPasswordPrompt">确认</n-button>
+          <n-modal
+            :show="roomPasswordPromptVisible"
+            preset="dialog"
+            title="房间密码"
+            :mask-closable="false"
+            @close="cancelRoomPasswordPrompt"
+          >
+            <n-space vertical :size="12">
+              <span>{{ roomPasswordPromptMessage }}</span>
+              <n-input
+                v-model:value="roomPasswordInput"
+                type="password"
+                show-password-on="click"
+                autofocus
+                placeholder="输入房间密码"
+                @keyup.enter="submitRoomPasswordPrompt"
+              />
+              <n-space justify="end">
+                <n-button secondary @click="cancelRoomPasswordPrompt">取消</n-button>
+                <n-button type="primary" @click="submitRoomPasswordPrompt">确认</n-button>
+              </n-space>
             </n-space>
-          </n-space>
-        </n-modal>
+          </n-modal>
 
-        <n-modal
-          :show="changelogModalVisible"
-          preset="dialog"
-          title="更新日志"
-          :mask-closable="false"
-          :closable="false"
-          style="width: min(672px, calc(100vw - 32px))"
-        >
-          <n-space vertical :size="14">
-            <div class="changelog-scroll">
-              <div v-for="entry in pendingChangelogEntries" :key="entry.version" class="changelog">
-                <div class="changelog-title">
-                  <span class="changelog-version">{{ entry.version }}</span>
-                  <span>{{ entry.title }}</span>
-                </div>
-                <div class="changelog-list">
-                  <div v-for="item in entry.items" :key="item" class="changelog-item">
-                    {{ item }}
+          <n-modal
+            :show="changelogModalVisible"
+            preset="dialog"
+            title="更新日志"
+            :mask-closable="false"
+            :closable="false"
+            style="width: min(672px, calc(100vw - 32px))"
+          >
+            <n-space vertical :size="14">
+              <div class="changelog-scroll">
+                <div
+                  v-for="entry in pendingChangelogEntries"
+                  :key="entry.version"
+                  class="changelog"
+                >
+                  <div class="changelog-title">
+                    <span class="changelog-version">{{ entry.version }}</span>
+                    <span>{{ entry.title }}</span>
+                  </div>
+                  <div class="changelog-list">
+                    <div v-for="item in entry.items" :key="item" class="changelog-item">
+                      {{ item }}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-            <n-space justify="end">
-              <n-button type="primary" @click="confirmChangelog">知道了</n-button>
+              <n-space justify="end">
+                <n-button type="primary" @click="confirmChangelog">知道了</n-button>
+              </n-space>
             </n-space>
-          </n-space>
-        </n-modal>
+          </n-modal>
 
-        <HomePage
-          v-if="page === 'home'"
-          :edit-user-name="editUserName"
-          :legacy-protocol-mode="profile.legacyProtocolMode"
-          :create-room-name="createRoomName"
-          :create-battle-id="createBattleId || null"
-          :battle-options="battleOptions"
-          :rooms="rooms"
-          @edit-user-name-change="editUserName = $event"
-          @legacy-protocol-mode-change="store.updateLegacyProtocolMode"
-          @create-room-name-change="createRoomName = $event"
-          @create-battle-id-change="createBattleId = $event ?? ''"
-          @create-room="handleCreateRoom"
-          @refresh-lobby="refreshLobby"
-          @join-room="handleJoinRoom"
-          @join-spectator="handleJoinSpectator"
-        />
-
-        <div v-else class="battle-page-shell">
-          <BattlePage
-            :room="room"
-            :snapshot="snapshot"
-            :controlled-actor-id="currentActor?.id ?? null"
-            :current-player-slot="currentPlayerSlot"
-            :camera-yaw="cameraYaw"
-            :camera-zoom="cameraZoom"
-            :operation-mode="operationMode"
-            :is-owner="isOwner"
-            :is-spectating="isSpectating"
-            :can-start="canStart"
-            :start-countdown-seconds="startCountdownSeconds"
-            :start-time-seconds="startTimeSeconds"
-            :start-time-options="startTimeOptions"
-            :battle-room-options="battleRoomOptions"
-            :server-countdown-seconds="serverCountdownSeconds"
-            :battle-start-notice-until-ms="battleStartNoticeUntilMs"
-            :logs="logs"
-            :latest-result="latestResult"
-            :arena-background="battleStaticData?.arenaBackground ?? null"
-            :status-metadata="battleStaticData?.statusMetadata ?? []"
-            :failed-status-icon-urls="failedStatusIconUrls"
-            :operation-mode-options="[
-              { label: '传统', value: 'traditional' },
-              { label: '标准', value: 'standard' },
-              { label: '固定', value: 'fixed' },
-            ]"
-            @use-knockback-immune="store.useKnockbackImmune($event)"
-            @use-sprint="store.useSprint($event)"
-            @spectate="store.spectate"
-            @start-battle="store.startBattle($event)"
-            @quick-fail="store.quickFail"
-            @room-options-change="store.updateRoomOptions($event)"
-            @start-countdown-seconds-change="startCountdownSeconds = $event"
-            @start-time-seconds-change="startTimeSeconds = $event"
-            @switch-slot="store.switchSlot($event)"
-            @kick-member="store.kickMember($event)"
-            @reset-zoom="resetCameraZoom"
-            @camera-yaw-change="updateCameraYaw"
-            @camera-zoom-change="updateCameraZoom"
-            @operation-mode-change="updateOperationMode"
-            @face-angle="handlePointerFaceAngle"
-            @status-icon-load-error="store.recordStatusIconLoadFailure($event)"
+          <HomePage
+            v-if="page === 'home'"
+            :create-room-name="createRoomName"
+            :create-battle-id="createBattleId || null"
+            :battle-options="battleOptions"
+            :rooms="rooms"
+            @create-room-name-change="createRoomName = $event"
+            @create-battle-id-change="createBattleId = $event ?? ''"
+            @create-room="handleCreateRoom"
+            @refresh-lobby="refreshLobby"
+            @join-room="handleJoinRoom"
+            @join-spectator="handleJoinSpectator"
           />
-        </div>
-      </main>
+
+          <div v-else class="battle-page-shell">
+            <BattlePage
+              :room="room"
+              :snapshot="snapshot"
+              :controlled-actor-id="currentActor?.id ?? null"
+              :current-player-slot="currentPlayerSlot"
+              :camera-yaw="cameraYaw"
+              :camera-zoom="cameraZoom"
+              :operation-mode="operationMode"
+              :is-owner="isOwner"
+              :is-spectating="isSpectating"
+              :can-start="canStart"
+              :start-countdown-seconds="startCountdownSeconds"
+              :start-time-seconds="startTimeSeconds"
+              :start-time-options="startTimeOptions"
+              :battle-room-options="battleRoomOptions"
+              :server-countdown-seconds="serverCountdownSeconds"
+              :battle-start-notice-until-ms="battleStartNoticeUntilMs"
+              :logs="logs"
+              :latest-result="latestResult"
+              :arena-background="battleStaticData?.arenaBackground ?? null"
+              :status-metadata="battleStaticData?.statusMetadata ?? []"
+              :failed-status-icon-urls="failedStatusIconUrls"
+              :operation-mode-options="[
+                { label: '传统', value: 'traditional' },
+                { label: '标准', value: 'standard' },
+                { label: '固定', value: 'fixed' },
+              ]"
+              @use-knockback-immune="store.useKnockbackImmune($event)"
+              @use-sprint="store.useSprint($event)"
+              @spectate="store.spectate"
+              @start-battle="store.startBattle($event)"
+              @reset-battle="store.resetBattle"
+              @room-options-change="store.updateRoomOptions($event)"
+              @start-countdown-seconds-change="startCountdownSeconds = $event"
+              @start-time-seconds-change="startTimeSeconds = $event"
+              @switch-slot="store.switchSlot($event)"
+              @kick-member="store.kickMember($event)"
+              @set-slot-occupant="store.setSlotOccupant($event)"
+              @reset-zoom="resetCameraZoom"
+              @camera-yaw-change="updateCameraYaw"
+              @camera-zoom-change="updateCameraZoom"
+              @operation-mode-change="updateOperationMode"
+              @face-angle="handlePointerFaceAngle"
+              @status-icon-load-error="store.recordStatusIconLoadFailure($event)"
+            />
+          </div>
+        </main>
     </div>
   </n-config-provider>
 </template>
@@ -846,4 +907,5 @@ onBeforeUnmount(() => {
     padding: 0 16px 16px;
   }
 }
+
 </style>

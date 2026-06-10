@@ -85,6 +85,20 @@ export function createRoomSlots(room: RoomRecord): RoomSlotState[] {
     const occupant = room.slots[slot];
     const actor = actorById.get(occupant.actorId);
 
+    if (occupant.type === 'empty') {
+      return {
+        slot,
+        occupantType: 'empty',
+        actorId: occupant.actorId,
+        ownerUserId: null,
+        name: null,
+        online: false,
+        currentHp: null,
+        alive: null,
+        knockbackImmune: false,
+      };
+    }
+
     if (occupant.type === 'bot') {
       return {
         slot,
@@ -116,6 +130,16 @@ export function createRoomSlots(room: RoomRecord): RoomSlotState[] {
 export function buildPartyBlueprint(room: RoomRecord): PartyMemberBlueprint[] {
   return PARTY_SLOT_ORDER.map((slot: PartySlot) => {
     const occupant = room.slots[slot];
+
+    if (occupant.type === 'empty') {
+      return {
+        slot,
+        name: '等待加入',
+        kind: 'bot',
+        actorId: occupant.actorId,
+        online: false,
+      };
+    }
 
     if (occupant.type === 'bot') {
       return {

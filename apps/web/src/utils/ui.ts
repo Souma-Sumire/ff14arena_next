@@ -132,18 +132,10 @@ export function getRoleColor(role: PartyRole): string {
   return roleColorMap[role];
 }
 
-export function getSlotColor(slot: RoomSlotState['slot'], isSelf = false): string {
-  if (isSelf) {
-    return '#8b5cf6';
-  }
-
+export function getSlotColor(slot: RoomSlotState['slot']): string {
   return getRoleColor(getSlotRole(slot));
 }
 
-export function getSlotCardBackground(slot: RoomSlotState['slot'], isSelf = false): string {
-  if (isSelf) {
-    return 'linear-gradient(135deg, rgba(120, 72, 194, 0.9), rgba(42, 24, 72, 0.96))';
-  }
-
+export function getSlotCardBackground(slot: RoomSlotState['slot']): string {
   return roleCardBackgroundMap[getSlotRole(slot)];
 }

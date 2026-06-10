@@ -1,7 +1,12 @@
 import protobuf from 'protobufjs';
 import type { MapMarker, Vector2 } from './base';
 import type { SimulationEvent } from './events';
-import type { SimEventsPayload, SimSnapshotPayload, SimStartPayload } from './protocol';
+import type {
+  SimEventsPayload,
+  SimSnapshotPayload,
+  SimStartPayload,
+  SimPoseDiffPayload,
+} from './protocol';
 import type {
   ActorKind,
   BaseActorSnapshot,
@@ -308,6 +313,23 @@ const root = protobuf.Root.fromJSON({
             payload: { type: 'ContinuousInputFramePayload', id: 5 },
           },
         },
+        ActorPoseDiff: {
+          fields: {
+            slotIndex: { type: 'int32', id: 1 },
+            x: { type: 'double', id: 2 },
+            y: { type: 'double', id: 3 },
+            facing: { type: 'double', id: 4 },
+          },
+        },
+        SimPoseDiffPayload: {
+          fields: {
+            roomId: { type: 'string', id: 1 },
+            syncId: { type: 'double', id: 2 },
+            tick: { type: 'double', id: 3 },
+            timeMs: { type: 'double', id: 4 },
+            poses: { rule: 'repeated', type: 'ActorPoseDiff', id: 5 },
+          },
+        },
       },
     },
   },
@@ -317,6 +339,7 @@ const simStartPayloadType = root.lookupType('ff14arena.SimStartPayload');
 const simSnapshotPayloadType = root.lookupType('ff14arena.SimSnapshotPayload');
 const simEventsPayloadType = root.lookupType('ff14arena.SimEventsPayload');
 const continuousInputFrameType = root.lookupType('ff14arena.ContinuousSimulationInputFrame');
+const simPoseDiffPayloadType = root.lookupType('ff14arena.SimPoseDiffPayload');
 
 const statusOptionalScalarKeys = ['multiplier'] as const;
 const actorOptionalScalarKeys = ['online'] as const;
@@ -1057,4 +1080,26 @@ export function decodeContinuousInputFrame(
   bytes: RealtimeBinaryPayload,
 ): ContinuousSimulationInputFrame {
   return inputFrameValue(decode(continuousInputFrameType, bytes));
+}
+
+export function encodeSimPoseDiffPayload(payload: SimPoseDiffPayload): Uint8Array {
+  return encode(simPoseDiffPayloadType, payload);
+}
+
+export function decodeSimPoseDiffPayload(bytes: RealtimeBinaryPayload): SimPoseDiffPayload {
+  const payload = decode(simPoseDiffPayloadType, bytes);
+  return {
+    roomId: String(payload.roomId ?? ''),
+    tick: numberValue(payload.tick),
+    timeMs: numberValue(payload.timeMs),
+    poses: arrayValue(payload.poses).map((p: unknown) => {
+      const item = (p ?? {}) as ProtoRecord;
+      return {
+        slotIndex: numberValue(item.slotIndex),
+        x: numberValue(item.x),
+        y: numberValue(item.y),
+        facing: numberValue(item.facing),
+      };
+    }),
+  };
 }

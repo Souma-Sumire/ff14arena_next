@@ -1,18 +1,7 @@
 <script setup lang="ts">
 import type { SelectOption } from 'naive-ui';
-import {
-  NButton,
-  NCard,
-  NEmpty,
-  NInputNumber,
-  NModal,
-  NSelect,
-  NSwitch,
-  NTag,
-  NText,
-} from 'naive-ui';
+import { NButton, NCard, NEmpty, NInputNumber, NModal, NSelect, NSwitch, NTag } from 'naive-ui';
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { PARTY_SLOT_ORDER } from '@ff14arena/shared';
 import type {
   BaseActorSnapshot,
   BattleArenaBackground,
@@ -28,15 +17,13 @@ import type {
 import {
   formatSkillCooldownLabel,
   getSlotCardBackground,
-  getSlotOnlineText,
   isCooldownReady,
+  getSlotRole,
   type OperationMode,
   type SelectValue,
 } from '../../utils/ui';
-import { loadPartyListOrder, savePartyListOrder } from '../../utils/party-list-order';
+import { loadPartyListOrder } from '../../utils/party-list-order';
 import BattleStage from '../battle/BattleStage.vue';
-const MIN_ZOOM = 0.7;
-const MAX_ZOOM = 2.4;
 const HUD_TICK_MS = 100;
 const MIN_START_COUNTDOWN_SECONDS = 1;
 const MAX_START_COUNTDOWN_SECONDS = 30;
@@ -77,7 +64,7 @@ const emit = defineEmits<{
   useSprint: [currentTimeMs: number];
   spectate: [];
   startBattle: [payload: StartBattlePayload];
-  quickFail: [];
+  resetBattle: [];
   roomOptionsChange: [
     payload: {
       options?: Partial<RoomStateDto['options']>;
@@ -94,7 +81,17 @@ const emit = defineEmits<{
   faceAngle: [facing: number];
   operationModeChange: [value: SelectValue];
   statusIconLoadError: [iconUrl: string];
+  setSlotOccupant: [
+    payload: {
+      slot: PartySlot;
+      occupantType: 'empty' | 'bot';
+    },
+  ];
 }>();
+
+const hasEmptySlotHint = computed(() => {
+  return props.room?.slots.some((slot) => slot.occupantType === 'empty') ?? false;
+});
 
 interface StatusViewModel {
   key: string;
@@ -137,17 +134,23 @@ const renderClockBase = ref({
 });
 const partyListOrder = ref<PartySlot[]>(loadPartyListOrder());
 const localFailedStatusIconUrls = ref(new Set<string>());
-const pendingSlotAction = ref<{
-  slot: PartySlot;
-  title: string;
-  description: string;
-  confirmLabel: string;
-} | null>(null);
+const showSpectatorPanel = ref(true);
+const showRoomSettingsPanel = ref(true);
+
+// 开始模拟后自动收起观战和设置面板
+watch(
+  () => props.snapshot?.phase,
+  (phase) => {
+    if (phase !== 'waiting' && phase !== undefined) {
+      showSpectatorPanel.value = false;
+      showRoomSettingsPanel.value = false;
+    }
+  },
+);
 const pendingKickAction = ref<{
   targetUserId: string;
   targetName: string;
 } | null>(null);
-const roomManagementVisible = ref(false);
 let hudTimer: number | null = null;
 
 const renderSimulationTimeMs = computed(() => {
@@ -204,7 +207,6 @@ const canUseSprint = computed(
     currentActor.value.mechanicActive &&
     isCooldownReady(currentActor.value.sprintCooldown, renderSimulationTimeMs.value),
 );
-const canQuickFail = computed(() => props.isOwner && props.snapshot?.phase === 'running');
 const knockbackButtonLabel = computed(() => {
   if (currentActor.value === null) {
     return '防击退（1）';
@@ -253,41 +255,6 @@ const startTimePresetOptions = computed<SelectOption[]>(() =>
 );
 const usesStartTimePresets = computed(() => startTimePresetOptions.value.length > 0);
 const deadActorsInteractEnabled = computed(() => props.room?.options.deadActorsInteract ?? true);
-const hasBattleRoomOptions = computed(() => props.battleRoomOptions.length > 0);
-const startTimeRoomHintLabel = computed(() =>
-  usesStartTimePresets.value ? '可选择阶段' : '可跳过时间',
-);
-const isPartyListDefaultOrder = computed(() =>
-  partyListOrder.value.every((slot, index) => slot === PARTY_SLOT_ORDER[index]),
-);
-const spectateButtonLabel = computed(() => {
-  if (props.isOwner && props.isSpectating) {
-    return isStartCountdownActive.value ? '倒计时中' : '开始';
-  }
-
-  return '观战';
-});
-const spectateButtonType = computed(() =>
-  props.isOwner && props.isSpectating ? 'warning' : 'info',
-);
-const spectateButtonDisabled = computed(() => {
-  if (props.isOwner && props.isSpectating) {
-    return props.snapshot?.phase !== 'waiting' || !props.canStart;
-  }
-
-  return (
-    props.snapshot?.phase !== 'waiting' || props.isSpectating || props.currentPlayerSlot === null
-  );
-});
-
-function handleSpectateButton(): void {
-  if (props.isOwner && props.isSpectating) {
-    emitStartBattle();
-    return;
-  }
-
-  emit('spectate');
-}
 
 function createStartBattlePayload(): StartBattlePayload {
   const startTimeMs =
@@ -311,47 +278,36 @@ function getSlotState(slot: PartySlot) {
   return slotMap.value.get(slot) ?? null;
 }
 
-function getSlotDisplayName(slot: PartySlot): string {
-  const slotState = getSlotState(slot);
-
-  if (slotState?.name !== null && slotState?.name !== undefined) {
-    return slotState.name;
+function getHpPercent(slot: PartySlot): number {
+  const actor = getActor(slot);
+  const state = getSlotState(slot);
+  if (state?.occupantType === 'empty' || !state) {
+    return 0;
   }
+  const current = actor?.currentHp ?? state?.currentHp ?? 0;
+  const max = actor?.maxHp ?? 10000;
+  if (max <= 0) return 0;
+  return Math.min(Math.max((current / max) * 100, 0), 100);
+}
 
-  if (slotState?.occupantType === 'empty') {
-    return `空位 [${slot}]`;
+function getHpBarColor(slot: PartySlot): string {
+  const actor = getActor(slot);
+  const state = getSlotState(slot);
+  if (state?.occupantType === 'empty' || !state) {
+    return 'rgba(255, 255, 255, 0.15)';
   }
-
-  return `[${slot}]`;
-}
-
-function isFirstPartyListSlot(slot: PartySlot): boolean {
-  return partyListOrder.value[0] === slot;
-}
-
-function isLastPartyListSlot(slot: PartySlot): boolean {
-  return partyListOrder.value[partyListOrder.value.length - 1] === slot;
-}
-
-function movePartyListSlot(slot: PartySlot, offset: -1 | 1): void {
-  const currentIndex = partyListOrder.value.indexOf(slot);
-  const targetIndex = currentIndex + offset;
-
-  if (currentIndex < 0 || targetIndex < 0 || targetIndex >= partyListOrder.value.length) {
-    return;
+  const current = actor?.currentHp ?? state?.currentHp ?? 0;
+  if (current <= 0) {
+    return '#4a4a4a';
   }
-
-  const nextOrder = [...partyListOrder.value];
-  nextOrder.splice(currentIndex, 1);
-  nextOrder.splice(targetIndex, 0, slot);
-  partyListOrder.value = nextOrder;
-  savePartyListOrder(nextOrder);
-}
-
-function resetPartyListOrder(): void {
-  const nextOrder = [...PARTY_SLOT_ORDER];
-  partyListOrder.value = nextOrder;
-  savePartyListOrder(nextOrder);
+  const role = getSlotRole(slot);
+  if (role === 'tank') {
+    return '#3571d7';
+  } else if (role === 'healer') {
+    return '#2ca859';
+  } else {
+    return '#ca3c3c';
+  }
 }
 
 function getOwnerTag(slot: PartySlot): {
@@ -466,20 +422,14 @@ function handleStatusIconError(status: StatusViewModel): void {
 }
 
 function getSlotButtonLabel(slot: PartySlot): string {
+  const slotState = getSlotState(slot);
+
   if (props.isSpectating) {
-    return getSlotState(slot)?.occupantType === 'player' ? '占用' : '入场';
+    return slotState?.occupantType === 'player' ? '已满' : '加入';
   }
 
   if (slot === props.currentPlayerSlot) {
-    if (props.isOwner) {
-      if (props.snapshot?.phase === 'running') {
-        return '房主';
-      }
-
-      return isStartCountdownActive.value ? '倒计时中' : '开始';
-    }
-
-    return '自己';
+    return '观战';
   }
 
   return '切换';
@@ -493,30 +443,26 @@ function getSlotButtonType(
   }
 
   if (slot === props.currentPlayerSlot) {
-    if (props.isOwner) {
-      return 'warning';
-    }
-
-    return 'default';
+    return 'warning';
   }
 
   return 'info';
 }
 
 function isSlotButtonDisabled(slot: PartySlot): boolean {
-  if (props.isSpectating) {
-    return props.snapshot?.phase !== 'waiting' || getSlotState(slot)?.occupantType === 'player';
-  }
-
-  if (slot === props.currentPlayerSlot) {
-    if (props.isOwner) {
-      return props.snapshot?.phase !== 'waiting' || !props.canStart;
-    }
-
+  if (isStartCountdownActive.value) {
     return true;
   }
 
-  return props.snapshot?.phase !== 'waiting';
+  if (props.snapshot?.phase !== 'waiting') {
+    return true;
+  }
+
+  if (props.isSpectating) {
+    return getSlotState(slot)?.occupantType === 'player';
+  }
+
+  return false;
 }
 
 function canKickSlot(slot: PartySlot): boolean {
@@ -542,48 +488,12 @@ function canKickSpectator(userId: string): boolean {
 }
 
 function handleSlotAction(slot: PartySlot): void {
-  if (props.isSpectating) {
-    pendingSlotAction.value = {
-      slot,
-      title: '确认入场',
-      description: `确认进入 ${getSlotDisplayName(slot)} 吗？`,
-      confirmLabel: '确认入场',
-    };
-    return;
-  }
-
   if (slot === props.currentPlayerSlot) {
-    if (props.isOwner) {
-      emitStartBattle();
-      return;
-    }
-
+    emit('spectate');
     return;
   }
 
-  pendingSlotAction.value = {
-    slot,
-    title: '确认换位',
-    description: `确认与 ${getSlotDisplayName(slot)} 交换位置吗？`,
-    confirmLabel: '确认换位',
-  };
-}
-
-function handleKickSlot(slot: PartySlot): void {
-  const slotState = getSlotState(slot);
-
-  if (
-    !canKickSlot(slot) ||
-    slotState?.ownerUserId === null ||
-    slotState?.ownerUserId === undefined
-  ) {
-    return;
-  }
-
-  pendingKickAction.value = {
-    targetUserId: slotState.ownerUserId,
-    targetName: slotState.name ?? `[${slot}]`,
-  };
+  emit('switchSlot', slot);
 }
 
 function handleKickSpectator(userId: string, name: string): void {
@@ -597,31 +507,8 @@ function handleKickSpectator(userId: string, name: string): void {
   };
 }
 
-function openRoomManagement(): void {
-  roomManagementVisible.value = true;
-}
-
-function closeRoomManagement(): void {
-  roomManagementVisible.value = false;
-}
-
-function cancelPendingSlotAction(): void {
-  pendingSlotAction.value = null;
-}
-
 function cancelPendingKickAction(): void {
   pendingKickAction.value = null;
-}
-
-function confirmPendingSlotAction(): void {
-  const action = pendingSlotAction.value;
-
-  if (action === null) {
-    return;
-  }
-
-  pendingSlotAction.value = null;
-  emit('switchSlot', action.slot);
 }
 
 function confirmPendingKickAction(): void {
@@ -641,14 +528,6 @@ function getResultTitle(result: EncounterResult | null): string {
   }
 
   return result.outcome === 'success' ? '上一轮成功' : '上一轮失败';
-}
-
-function handleZoomInput(value: number | null): void {
-  if (value === null || Number.isNaN(value)) {
-    return;
-  }
-
-  emit('cameraZoomChange', Math.min(Math.max(value, MIN_ZOOM), MAX_ZOOM));
 }
 
 function handleStartCountdownSecondsInput(value: number | null): void {
@@ -721,106 +600,277 @@ onBeforeUnmount(() => {
           <p class="eyebrow">小队</p>
           <h2 class="section-title">成员列表</h2>
         </div>
-        <n-button
-          tertiary
-          size="small"
-          class="party-reset-button"
-          :disabled="isPartyListDefaultOrder"
-          @click="resetPartyListOrder"
-        >
-          恢复默认
-        </n-button>
       </div>
       <div class="slot-list">
         <div
           v-for="slot in partyListOrder"
           :key="slot"
           class="slot-card"
-          :style="{ background: getSlotCardBackground(slot, slot === props.currentPlayerSlot) }"
+          :class="{
+            'is-self': slot === props.currentPlayerSlot,
+            'is-empty': !getSlotState(slot) || getSlotState(slot)?.occupantType === 'empty',
+            'is-bot': getSlotState(slot)?.occupantType === 'bot',
+          }"
+          :style="
+            getSlotState(slot)?.occupantType === 'empty'
+              ? {}
+              : { background: getSlotCardBackground(slot) }
+          "
         >
-          <div class="slot-row">
-            <div class="slot-title">
-              <span class="slot-label">[{{ slot }}]</span>
-              <span>{{ getSlotState(slot)?.name ?? '等待加入' }}</span>
+          <!-- 第一行：职业插槽、信息、控制 -->
+          <div class="slot-main-row">
+            <!-- 左侧：职业插槽标识 -->
+            <div class="slot-badge-area">
+              <div class="slot-role-badge" :class="getSlotRole(slot)">
+                {{ slot }}
+              </div>
             </div>
-            <n-button
-              secondary
-              strong
-              class="slot-button"
-              :type="getSlotButtonType(slot)"
-              :disabled="isSlotButtonDisabled(slot)"
-              @click="handleSlotAction(slot)"
-            >
-              {{ getSlotButtonLabel(slot) }}
-            </n-button>
-          </div>
 
-          <div class="slot-order-controls">
-            <n-button
-              tertiary
-              size="tiny"
-              class="slot-order-button"
-              :disabled="isFirstPartyListSlot(slot)"
-              @click="movePartyListSlot(slot, -1)"
-            >
-              上移
-            </n-button>
-            <n-button
-              tertiary
-              size="tiny"
-              class="slot-order-button"
-              :disabled="isLastPartyListSlot(slot)"
-              @click="movePartyListSlot(slot, 1)"
-            >
-              下移
-            </n-button>
-          </div>
-
-          <div class="slot-row secondary">
-            <span
-              >{{ getActor(slot)?.currentHp ?? getSlotState(slot)?.currentHp ?? 0 }} /
-              {{ getActor(slot)?.maxHp ?? 10000 }}</span
-            >
-            <span class="slot-meta">
-              {{
-                slot === props.currentPlayerSlot
-                  ? '自己'
-                  : getSlotState(slot)?.occupantType === 'bot'
-                    ? 'Bot'
-                    : '玩家'
-              }}
-              <template v-if="getOwnerTag(slot) !== null">
-                ·
-                <n-tag
-                  class="owner-tag"
-                  :type="getOwnerTag(slot)!.type"
-                  size="small"
-                  :bordered="false"
+            <!-- 中部：姓名、HP数值和生命条 -->
+            <div class="slot-info-area">
+              <div class="slot-info-header">
+                <span class="slot-name">
+                  {{ getSlotState(slot)?.name ?? '等待加入' }}
+                  <span v-if="slot === props.currentPlayerSlot" class="self-badge">我</span>
+                  <span v-if="getOwnerTag(slot) !== null" class="owner-badge">房主</span>
+                  <span v-if="getSlotState(slot)?.occupantType === 'bot'" class="bot-badge"
+                    >Bot</span
+                  >
+                  <span
+                    v-if="
+                      getSlotState(slot)?.occupantType === 'player' && !getSlotState(slot)?.online
+                    "
+                    class="offline-badge"
+                    >离线</span
+                  >
+                </span>
+                <span
+                  v-if="getSlotState(slot) && getSlotState(slot)?.occupantType !== 'empty'"
+                  class="slot-hp-text"
                 >
-                  {{ getOwnerTag(slot)!.label }}
-                </n-tag>
-              </template>
-            </span>
+                  {{ getActor(slot)?.currentHp ?? getSlotState(slot)?.currentHp ?? 0 }}/{{
+                    getActor(slot)?.maxHp ?? 10000
+                  }}
+                </span>
+              </div>
+
+              <!-- 生命条 -->
+              <div class="slot-hp-bar-track">
+                <div
+                  class="slot-hp-bar-fill"
+                  :style="{
+                    width: getHpPercent(slot) + '%',
+                    background: getHpBarColor(slot),
+                  }"
+                ></div>
+              </div>
+            </div>
+
+            <!-- 控制操作区 -->
+            <div class="slot-controls-area">
+              <n-button
+                v-if="props.isOwner && getSlotState(slot)?.occupantType !== 'player'"
+                secondary
+                strong
+                size="tiny"
+                class="slot-type-btn"
+                @click.stop="
+                  emit('setSlotOccupant', {
+                    slot,
+                    occupantType: getSlotState(slot)?.occupantType === 'bot' ? 'empty' : 'bot',
+                  })
+                "
+              >
+                {{ getSlotState(slot)?.occupantType === 'bot' ? '清空' : '托管' }}
+              </n-button>
+              <n-button
+                secondary
+                strong
+                size="tiny"
+                class="slot-action-btn"
+                :type="getSlotButtonType(slot)"
+                :disabled="isSlotButtonDisabled(slot)"
+                @click.stop="handleSlotAction(slot)"
+              >
+                {{ getSlotButtonLabel(slot) }}
+              </n-button>
+              <button
+                v-if="canKickSlot(slot)"
+                class="slot-kick-btn"
+                title="踢出房间"
+                @click.stop="emit('kickMember', getSlotState(slot)!.ownerUserId!)"
+              >
+                ✕
+              </button>
+            </div>
           </div>
 
-          <div class="slot-row status-row">
+          <!-- 第二行：Buff/Debuff 状态图标列表 -->
+          <div class="slot-status-area">
             <span
               v-for="status in getMechanicStatusRows(slot)"
               :key="status.key"
-              class="status-icon-cell"
+              class="status-icon-cell-compact"
               :title="status.title"
             >
               <img
                 v-if="status.iconUrl !== null && !status.iconFailed"
-                class="status-icon"
+                class="status-icon-compact"
                 :src="status.iconUrl"
                 :alt="status.name"
                 draggable="false"
                 @error="handleStatusIconError(status)"
               />
-              <span v-else class="status-icon-fallback">{{ status.fallbackText }}</span>
-              <span class="status-countdown">{{ status.countdownLabel }}</span>
+              <span v-else class="status-icon-fallback-compact">{{ status.fallbackText }}</span>
+              <span v-if="status.countdownLabel" class="status-countdown-compact">{{
+                status.countdownLabel.replace('秒', '')
+              }}</span>
             </span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 观战席区域 -->
+      <div v-if="props.room" class="spectator-list-panel">
+        <div class="spectator-list-header" @click="showSpectatorPanel = !showSpectatorPanel">
+          <h2 class="section-title">
+            观战席
+            <span v-if="props.room.spectators.length" class="spectator-count"
+              >({{ props.room.spectators.length }}人)</span
+            >
+          </h2>
+          <span class="panel-toggle-icon" :class="{ 'is-collapsed': !showSpectatorPanel }"></span>
+        </div>
+        <div v-if="showSpectatorPanel" class="spectator-list-wrapper">
+          <div v-if="props.room.spectators.length > 0" class="spectator-items">
+            <span
+              v-for="spectator in props.room.spectators"
+              :key="spectator.userId"
+              class="spectator-bubble-tag"
+            >
+              <span class="spectator-name-text">{{ spectator.name }}</span>
+              <span v-if="spectator.userId === props.room.ownerUserId" class="owner-badge"
+                >房主</span
+              >
+              <span v-if="!spectator.online" class="offline-badge">离线</span>
+              <button
+                v-if="canKickSpectator(spectator.userId)"
+                class="spectator-kick-x"
+                title="移出房间"
+                @click.stop="handleKickSpectator(spectator.userId, spectator.name)"
+              >
+                ✕
+              </button>
+            </span>
+          </div>
+          <div v-else class="spectator-empty-text">暂无观战人员</div>
+        </div>
+      </div>
+
+      <!-- 房间与机制设置区 -->
+      <div v-if="props.room" class="room-settings-panel">
+        <div class="room-settings-header" @click="showRoomSettingsPanel = !showRoomSettingsPanel">
+          <h2 class="section-title">房间与机制</h2>
+          <span
+            class="panel-toggle-icon"
+            :class="{ 'is-collapsed': !showRoomSettingsPanel }"
+          ></span>
+        </div>
+        <div v-if="showRoomSettingsPanel" class="room-settings-body">
+          <!-- 倒计时与跳时 -->
+          <div class="setting-row">
+            <span class="setting-label">起跑倒计时</span>
+            <n-input-number
+              size="tiny"
+              class="setting-input-number"
+              :min="MIN_START_COUNTDOWN_SECONDS"
+              :max="MAX_START_COUNTDOWN_SECONDS"
+              :step="1"
+              :precision="0"
+              :disabled="
+                isStartCountdownActive || !props.isOwner || props.snapshot?.phase !== 'waiting'
+              "
+              :value="props.startCountdownSeconds"
+              @update:value="handleStartCountdownSecondsInput"
+            />
+          </div>
+          <div v-if="supportsStartTime" class="setting-row">
+            <span class="setting-label">跳过/阶段时间</span>
+            <n-select
+              v-if="usesStartTimePresets"
+              size="tiny"
+              class="setting-select"
+              :options="startTimePresetOptions"
+              :disabled="
+                isStartCountdownActive || !props.isOwner || props.snapshot?.phase !== 'waiting'
+              "
+              :value="Math.round(props.startTimeSeconds * 1_000)"
+              @update:value="handleStartTimePresetChange"
+            />
+            <n-input-number
+              v-else
+              size="tiny"
+              class="setting-input-number"
+              :min="(props.startTimeOptions?.minMs ?? 0) / 1_000"
+              :max="(props.startTimeOptions?.maxMs ?? 0) / 1_000"
+              :step="START_TIME_STEP_SECONDS"
+              :precision="2"
+              :disabled="
+                isStartCountdownActive || !props.isOwner || props.snapshot?.phase !== 'waiting'
+              "
+              :value="props.startTimeSeconds"
+              @update:value="handleStartTimeSecondsInput"
+            />
+          </div>
+
+          <!-- 核心开关：死亡后是否参与机制 -->
+          <div class="setting-row">
+            <div class="setting-label-block">
+              <span class="setting-label">死亡参与机制</span>
+              <span class="setting-desc">死亡后扮演尸体是否能继续触发机制判定</span>
+            </div>
+            <n-switch
+              size="small"
+              :value="deadActorsInteractEnabled"
+              :disabled="
+                isStartCountdownActive || !props.isOwner || props.snapshot?.phase !== 'waiting'
+              "
+              @update:value="
+                emit('roomOptionsChange', {
+                  options: {
+                    deadActorsInteract: $event,
+                  },
+                })
+              "
+            />
+          </div>
+
+          <!-- 具体机制选项 -->
+          <div
+            v-for="option in props.battleRoomOptions"
+            :key="option.key"
+            class="setting-row mechanic-option-row"
+          >
+            <div class="setting-label-block">
+              <span class="setting-label">{{ option.title }}</span>
+              <span v-if="option.description" class="setting-desc">
+                {{ option.description }}
+              </span>
+            </div>
+            <n-switch
+              size="small"
+              :value="getBattleRoomOptionValue(option)"
+              :disabled="
+                isStartCountdownActive || !props.isOwner || props.snapshot?.phase !== 'waiting'
+              "
+              @update:value="
+                emit('roomOptionsChange', {
+                  mechanicOptions: {
+                    [option.key]: $event,
+                  },
+                })
+              "
+            />
           </div>
         </div>
       </div>
@@ -836,49 +886,48 @@ onBeforeUnmount(() => {
                 {{ props.snapshot?.battleName ?? props.room?.battleName ?? '未选择战斗' }}
               </h2>
             </div>
+
             <div class="stage-meta">
-              <div class="room-management-entry">
-                <n-tag
-                  v-if="props.isOwner && hasBattleRoomOptions"
-                  class="room-management-hint-tag clickable"
-                  size="small"
-                  type="success"
-                  :bordered="false"
-                  title="当前机制有可配置选项"
-                  @click="openRoomManagement"
-                >
-                  存在机制选项
-                </n-tag>
-                <n-tag
-                  v-if="props.isOwner && supportsStartTime"
-                  class="room-management-hint-tag clickable"
-                  size="small"
-                  type="info"
-                  :bordered="false"
-                  title="当前战斗支持从指定时间开始"
-                  @click="openRoomManagement"
-                >
-                  {{ startTimeRoomHintLabel }}
-                </n-tag>
-                <n-button
-                  secondary
-                  strong
-                  class="room-management-button"
-                  @click="openRoomManagement"
-                >
-                  房间管理
-                </n-button>
-              </div>
-              <n-button
-                secondary
-                strong
-                class="spectate-button"
-                :type="spectateButtonType"
-                :disabled="spectateButtonDisabled"
-                @click="handleSpectateButton"
+              <template v-if="props.isOwner">
+                <div class="start-button-area">
+                  <n-button
+                    :type="props.snapshot?.phase === 'running' ? 'error' : 'primary'"
+                    strong
+                    class="start-battle-button"
+                    :disabled="
+                      props.snapshot?.phase === 'running'
+                        ? false
+                        : props.snapshot?.phase !== 'waiting' || !props.canStart
+                    "
+                    @click="
+                      props.snapshot?.phase === 'running' ? emit('resetBattle') : emitStartBattle()
+                    "
+                  >
+                    {{
+                      props.snapshot?.phase === 'running'
+                        ? '停止模拟'
+                        : isStartCountdownActive
+                          ? '开始倒计时中...'
+                          : '开始模拟'
+                    }}
+                  </n-button>
+                  <span
+                    v-if="props.snapshot?.phase === 'waiting' && !props.canStart"
+                    class="start-button-hint"
+                  >
+                    {{ hasEmptySlotHint ? '请先补满小队空位' : '请先选择战斗' }}
+                  </span>
+                </div>
+              </template>
+              <n-tag
+                v-else
+                :type="props.isSpectating ? 'info' : 'success'"
+                size="medium"
+                :bordered="false"
+                class="spectator-status-tag"
               >
-                {{ spectateButtonLabel }}
-              </n-button>
+                {{ props.isSpectating ? '观战席' : '参战中' }}
+              </n-tag>
               <n-select
                 class="stage-mode-select"
                 size="small"
@@ -886,23 +935,31 @@ onBeforeUnmount(() => {
                 :options="props.operationModeOptions"
                 @update:value="emit('operationModeChange', $event)"
               />
-              <div class="zoom-control">
-                <span class="zoom-label">缩放</span>
-                <n-input-number
-                  size="small"
-                  class="zoom-input"
-                  :min="MIN_ZOOM"
-                  :max="MAX_ZOOM"
-                  :step="0.1"
-                  :precision="1"
-                  :value="Number(props.cameraZoom.toFixed(1))"
-                  @update:value="handleZoomInput"
-                />
-              </div>
+              <span class="stage-mode-hint">
+                {{
+                  props.operationMode === 'traditional'
+                    ? '移动方向跟随镜头，移动时人物自动转向'
+                    : props.operationMode === 'standard'
+                      ? '右键拖拽同时转镜头和人物，移动方向跟随人物朝向'
+                      : '地图固定不旋转，WASD 按地图方向移动'
+                }}
+              </span>
             </div>
           </div>
 
           <div class="stage-shell">
+            <div
+              v-if="
+                props.isSpectating && props.snapshot?.phase === 'waiting' && !isStartCountdownActive
+              "
+              class="spectator-welcome-overlay"
+            >
+              <div class="welcome-card">
+                <h3 class="welcome-title">观战中</h3>
+                <p class="welcome-desc">点击小队中的【加入】或【切换】即可入场</p>
+              </div>
+            </div>
+            <div v-if="props.isSpectating" class="spectate-overlay-hint">观战中</div>
             <div class="cast-overlay">
               <template
                 v-for="castBar in castBars"
@@ -967,25 +1024,7 @@ onBeforeUnmount(() => {
             >
               {{ sprintButtonLabel }}
             </n-button>
-            <n-button tertiary @click="emit('resetZoom')">重置缩放</n-button>
-            <n-button
-              v-if="props.isOwner"
-              tertiary
-              type="error"
-              :disabled="!canQuickFail"
-              @click="emit('quickFail')"
-            >
-              快速失败
-            </n-button>
-            <n-text depth="3" class="stage-hint">
-              {{
-                props.operationMode === 'traditional'
-                  ? '传统：移动方向跟随镜头，移动时人物自动转向。'
-                  : props.operationMode === 'standard'
-                    ? '标准：右键拖拽同时转镜头和人物，移动方向跟随人物朝向。'
-                    : '固定：地图固定在中央且不旋转，WASD 按地图方向移动。'
-              }}
-            </n-text>
+            <n-button tertiary @click="emit('resetZoom')">重置视角</n-button>
           </div>
         </div>
       </n-card>
@@ -1043,215 +1082,6 @@ onBeforeUnmount(() => {
       </n-card>
     </aside>
   </div>
-
-  <n-modal
-    :show="pendingSlotAction !== null"
-    :mask-closable="false"
-    @update:show="(show) => !show && cancelPendingSlotAction()"
-  >
-    <div class="slot-confirm-modal">
-      <h3 class="slot-confirm-title">{{ pendingSlotAction?.title }}</h3>
-      <p class="slot-confirm-description">{{ pendingSlotAction?.description }}</p>
-      <div class="slot-confirm-actions">
-        <n-button tertiary @click="cancelPendingSlotAction">取消</n-button>
-        <n-button type="primary" @click="confirmPendingSlotAction">
-          {{ pendingSlotAction?.confirmLabel ?? '确认' }}
-        </n-button>
-      </div>
-    </div>
-  </n-modal>
-
-  <n-modal
-    :show="roomManagementVisible"
-    :mask-closable="true"
-    @update:show="(show) => !show && closeRoomManagement()"
-  >
-    <div class="room-management-modal">
-      <div class="room-management-header">
-        <div>
-          <p class="eyebrow">房间管理</p>
-          <h3 class="room-management-title">{{ props.room?.name ?? '当前房间' }}</h3>
-        </div>
-        <n-button tertiary @click="closeRoomManagement">关闭</n-button>
-      </div>
-
-      <div class="room-management-body">
-        <div
-          v-if="props.isOwner && props.snapshot?.phase === 'waiting'"
-          class="room-management-controls"
-        >
-          <div class="room-management-control">
-            <span class="room-management-control-label">倒计时</span>
-            <n-input-number
-              size="small"
-              class="countdown-input"
-              :min="MIN_START_COUNTDOWN_SECONDS"
-              :max="MAX_START_COUNTDOWN_SECONDS"
-              :step="1"
-              :precision="0"
-              :disabled="isStartCountdownActive"
-              :value="props.startCountdownSeconds"
-              @update:value="handleStartCountdownSecondsInput"
-            />
-          </div>
-          <div v-if="supportsStartTime" class="room-management-control">
-            <span class="room-management-control-label">开始时间</span>
-            <n-select
-              v-if="usesStartTimePresets"
-              size="small"
-              class="countdown-input start-time-input"
-              :options="startTimePresetOptions"
-              :disabled="isStartCountdownActive"
-              :value="Math.round(props.startTimeSeconds * 1_000)"
-              @update:value="handleStartTimePresetChange"
-            />
-            <n-input-number
-              v-else
-              size="small"
-              class="countdown-input start-time-input"
-              :min="(props.startTimeOptions?.minMs ?? 0) / 1_000"
-              :max="(props.startTimeOptions?.maxMs ?? 0) / 1_000"
-              :step="START_TIME_STEP_SECONDS"
-              :precision="2"
-              :disabled="isStartCountdownActive"
-              :value="props.startTimeSeconds"
-              @update:value="handleStartTimeSecondsInput"
-            />
-          </div>
-          <div class="room-management-control">
-            <span class="room-management-control-label">死亡后参与机制</span>
-            <n-switch
-              size="small"
-              :value="deadActorsInteractEnabled"
-              :disabled="isStartCountdownActive"
-              @update:value="
-                emit('roomOptionsChange', {
-                  options: {
-                    deadActorsInteract: $event,
-                  },
-                })
-              "
-            />
-          </div>
-          <div
-            v-for="option in props.battleRoomOptions"
-            :key="option.key"
-            class="room-management-control room-mechanic-option-control"
-          >
-            <span class="room-management-control-label">{{ option.title }}</span>
-            <span class="room-management-control-description">{{ option.description }}</span>
-            <n-switch
-              size="small"
-              :value="getBattleRoomOptionValue(option)"
-              :disabled="isStartCountdownActive"
-              @update:value="
-                emit('roomOptionsChange', {
-                  mechanicOptions: {
-                    [option.key]: $event,
-                  },
-                })
-              "
-            />
-          </div>
-        </div>
-
-        <div class="room-management-section">
-          <div class="room-management-section-title">场内成员</div>
-          <div class="room-member-list">
-            <div
-              v-for="slotState in props.room?.slots ?? []"
-              :key="slotState.slot"
-              class="room-member-row"
-            >
-              <div class="room-member-main">
-                <n-tag size="small" :bordered="false">{{ slotState.slot }}</n-tag>
-                <span class="room-member-name">{{ slotState.name ?? '等待加入' }}</span>
-                <n-tag
-                  size="small"
-                  :type="slotState.occupantType === 'bot' ? 'info' : 'default'"
-                  :bordered="false"
-                >
-                  {{ slotState.occupantType === 'bot' ? 'Bot' : '玩家' }}
-                </n-tag>
-                <n-tag
-                  v-if="slotState.occupantType === 'player'"
-                  class="online-tag"
-                  :type="slotState.online ? 'success' : 'warning'"
-                  size="small"
-                  :bordered="false"
-                >
-                  {{ getSlotOnlineText(slotState) }}
-                </n-tag>
-                <n-tag
-                  v-if="slotState.ownerUserId === props.room?.ownerUserId"
-                  class="owner-tag"
-                  type="warning"
-                  size="small"
-                  :bordered="false"
-                >
-                  房主
-                </n-tag>
-              </div>
-              <n-button
-                v-if="canKickSlot(slotState.slot)"
-                tertiary
-                strong
-                size="small"
-                type="error"
-                @click="handleKickSlot(slotState.slot)"
-              >
-                移出
-              </n-button>
-            </div>
-          </div>
-        </div>
-
-        <div class="room-management-section">
-          <div class="room-management-section-title">观战成员</div>
-          <div v-if="props.room?.spectators.length" class="room-member-list">
-            <div
-              v-for="spectator in props.room.spectators"
-              :key="spectator.userId"
-              class="room-member-row"
-            >
-              <div class="room-member-main">
-                <n-tag size="small" :bordered="false">观战</n-tag>
-                <span class="room-member-name">{{ spectator.name }}</span>
-                <n-tag
-                  class="online-tag"
-                  :type="spectator.online ? 'success' : 'warning'"
-                  size="small"
-                  :bordered="false"
-                >
-                  {{ spectator.online ? '在线' : '离线' }}
-                </n-tag>
-                <n-tag
-                  v-if="spectator.userId === props.room?.ownerUserId"
-                  class="owner-tag"
-                  type="warning"
-                  size="small"
-                  :bordered="false"
-                >
-                  房主
-                </n-tag>
-              </div>
-              <n-button
-                v-if="canKickSpectator(spectator.userId)"
-                tertiary
-                strong
-                size="small"
-                type="error"
-                @click="handleKickSpectator(spectator.userId, spectator.name)"
-              >
-                移出
-              </n-button>
-            </div>
-          </div>
-          <n-empty v-else description="暂无观战成员。" />
-        </div>
-      </div>
-    </div>
-  </n-modal>
 
   <n-modal
     :show="pendingKickAction !== null"
@@ -1316,355 +1146,496 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
-.party-reset-button {
-  flex: 0 0 auto;
-  font-weight: 700;
-}
-
 .slot-list {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  grid-template-rows: repeat(4, minmax(0, 1fr));
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   flex: 1 1 auto;
-  gap: 8px;
   min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
+/* 整个卡片容器 */
 .slot-card {
   display: flex;
   flex-direction: column;
+  gap: 4px;
   min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 8px;
-  padding: 8px 9px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  padding: 6px 10px 8px 10px;
+  border-left: 3px solid transparent;
+  border-radius: 4px;
+  position: relative;
+  box-sizing: border-box;
+  background: rgba(255, 255, 255, 0.03);
+  transition: background 0.15s ease;
 }
 
-.slot-row {
+/* 第一行容器 */
+.slot-main-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
   min-width: 0;
 }
 
-.slot-row.secondary {
-  margin-top: 6px;
-  font-size: 12px;
-  color: rgba(246, 239, 228, 0.86);
+.slot-card:hover {
+  background: rgba(255, 255, 255, 0.06);
 }
 
-.slot-row.status-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, 28px);
-  grid-auto-rows: 45px;
-  justify-content: start;
-  gap: 4px 5px;
-  margin-top: 6px;
-  min-height: 94px;
-  align-items: start;
-  overflow: hidden;
+/* 自己（本人）的高亮样式 */
+.slot-card.is-self {
+  border-left-color: rgba(226, 164, 112, 0.7);
+  background: rgba(226, 164, 112, 0.06);
 }
 
-.status-icon-cell {
-  position: relative;
-  display: grid;
-  grid-template-rows: 32px 11px;
-  justify-items: center;
-  align-items: start;
-  width: 28px;
-  min-width: 0;
-  overflow: hidden;
+/* 空插槽的虚线样式 */
+.slot-card.is-empty {
+  background: transparent;
+  opacity: 0.5;
 }
 
-.status-icon,
-.status-icon-fallback {
-  width: 24px;
-  height: 32px;
-  border: 1px solid rgba(246, 239, 228, 0.18);
-  border-radius: 3px;
-  box-sizing: border-box;
-  background: rgba(0, 0, 0, 0.28);
+.slot-card.is-empty:hover {
+  background: rgba(255, 255, 255, 0.03);
+  opacity: 0.7;
 }
 
-.status-icon {
-  display: block;
-  object-fit: cover;
+/* 左侧职业角色角标 */
+.slot-badge-area {
+  flex: 0 0 auto;
 }
 
-.status-icon-fallback {
+.slot-role-badge {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: rgba(246, 239, 228, 0.88);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.1;
-  text-align: center;
-}
-
-.status-countdown {
-  width: 28px;
-  color: rgba(246, 239, 228, 0.78);
+  width: 30px;
+  height: 18px;
+  border-radius: 3px;
   font-size: 10px;
-  line-height: 11px;
-  text-align: center;
-  white-space: nowrap;
-}
-
-.slot-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  font-size: 14px;
   font-weight: 700;
+  color: #ffffff;
 }
 
-.slot-title span:last-child {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.slot-role-badge.tank {
+  background: rgba(77, 141, 255, 0.55);
 }
 
-.slot-label {
-  color: rgba(255, 255, 255, 0.92);
+.slot-role-badge.healer {
+  background: rgba(63, 191, 114, 0.55);
 }
 
-.slot-button {
-  min-width: 58px;
-  font-weight: 700;
-  color: #f6efe4;
-  border-width: 1px;
-  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.26);
-  backdrop-filter: blur(10px);
+.slot-role-badge.dps {
+  background: rgba(213, 76, 76, 0.55);
 }
 
-.slot-order-controls {
-  display: flex;
-  gap: 4px;
-  margin-top: 5px;
-}
-
-.slot-order-button {
-  flex: 1 1 0;
-  min-width: 0;
-  font-size: 11px;
-}
-
-.slot-button:deep(.n-button__border) {
-  opacity: 0.42;
-}
-
-.slot-button:deep(.n-button__state-border) {
-  opacity: 0.22;
-}
-
-.slot-meta {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-  color: rgba(246, 239, 228, 0.7);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.owner-tag {
-  height: 18px;
-  line-height: 18px;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.online-tag {
-  height: 18px;
-  line-height: 18px;
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.room-management-button {
-  min-width: 92px;
-  font-weight: 700;
-}
-
-.room-management-entry {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-
-.room-management-hint-tag.clickable {
-  cursor: pointer;
-}
-
-.room-management-modal {
-  display: flex;
-  flex-direction: column;
-  width: min(760px, calc(100vw - 32px));
-  max-height: min(720px, calc(100vh - 48px));
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
-  background: rgba(26, 22, 20, 0.98);
-  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.52);
-}
-
-.room-management-header {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 18px 18px 14px;
-}
-
-.room-management-title {
-  margin: 0;
-  color: #f6efe4;
-  font-size: 20px;
-  font-weight: 700;
-}
-
-.room-management-body {
-  display: flex;
+/* 中部名字与生命值 */
+.slot-info-area {
   flex: 1 1 auto;
-  flex-direction: column;
-  min-height: 0;
-  overflow: auto;
-  padding: 16px 18px 18px;
-  scrollbar-color: rgba(201, 139, 90, 0.7) rgba(255, 255, 255, 0.05);
-  scrollbar-width: thin;
-}
-
-.room-management-body::-webkit-scrollbar {
-  width: 10px;
-}
-
-.room-management-body::-webkit-scrollbar-track {
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-}
-
-.room-management-body::-webkit-scrollbar-thumb {
-  border: 2px solid rgba(26, 22, 20, 0.98);
-  border-radius: 999px;
-  background: rgba(201, 139, 90, 0.7);
-}
-
-.room-management-body::-webkit-scrollbar-thumb:hover {
-  background: rgba(226, 164, 112, 0.9);
-}
-
-.room-management-controls {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 10px;
-  margin-bottom: 16px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.025);
-  padding: 12px;
-}
-
-.room-management-control {
-  display: flex;
-  align-items: center;
-  gap: 8px;
   min-width: 0;
-}
-
-.room-mechanic-option-control {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-}
-
-.room-management-control-label {
-  flex: 0 0 auto;
-  color: rgba(246, 239, 228, 0.72);
-  font-size: 12px;
-  white-space: nowrap;
-}
-
-.room-mechanic-option-control .room-management-control-label {
-  white-space: normal;
-}
-
-.room-management-control-description {
-  grid-column: 1;
-  min-width: 0;
-  color: rgba(246, 239, 228, 0.52);
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.room-mechanic-option-control .n-switch {
-  grid-column: 2;
-  grid-row: 1 / span 2;
-}
-
-.room-management-section {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  justify-content: center;
+  gap: 3px;
 }
 
-.room-management-section + .room-management-section {
-  margin-top: 16px;
+.slot-info-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  line-height: 1;
 }
 
-.room-management-section-title {
-  color: rgba(246, 239, 228, 0.68);
+.slot-name {
   font-size: 13px;
   font-weight: 700;
+  color: rgba(246, 239, 228, 0.95);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
-.room-member-list {
+.self-badge {
+  font-size: 9px;
+  background: rgba(226, 164, 112, 0.16);
+  border: 1px solid rgba(226, 164, 112, 0.4);
+  color: #e2a470;
+  padding: 0 3px;
+  border-radius: 2px;
+  font-weight: 800;
+  transform: scale(0.9);
+  transform-origin: left center;
+}
+
+.owner-badge {
+  font-size: 9px;
+  background: rgba(77, 141, 255, 0.16);
+  border: 1px solid rgba(77, 141, 255, 0.4);
+  color: #4d8dff;
+  padding: 0 3px;
+  border-radius: 2px;
+  font-weight: 800;
+  transform: scale(0.9);
+  transform-origin: left center;
+}
+
+.slot-hp-text {
+  font-size: 10px;
+  font-family: monospace;
+  color: rgba(246, 239, 228, 0.65);
+  flex-shrink: 0;
+}
+
+/* HP 进度条轨道 */
+.slot-hp-bar-track {
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.slot-hp-bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 0.3s cubic-bezier(0.1, 0.8, 0.1, 1);
+}
+
+/* 第二行状态图标区 */
+.slot-status-area {
   display: flex;
-  flex-direction: column;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-width: 0;
+  min-height: 28px;
+}
+
+.status-icon-cell-compact {
+  position: relative;
+  display: inline-block;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+
+.status-icon-compact {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.3);
+  box-sizing: border-box;
+}
+
+.slot-kick-btn {
+  background: rgba(239, 68, 68, 0.15);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #f87171;
+  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 11px;
+  margin-left: 6px;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.slot-kick-btn:hover {
+  background: rgba(239, 68, 68, 0.3);
+  border-color: #ef4444;
+  color: #ffffff;
+  box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
+}
+
+.status-icon-fallback-compact {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  font-size: 9px;
+  font-weight: bold;
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(246, 239, 228, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+
+.status-countdown-compact {
+  position: absolute;
+  bottom: -11px;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 800;
+  color: #ffffff;
+  text-shadow:
+    1px 1px 0 #000,
+    -1px -1px 0 #000,
+    1px -1px 0 #000,
+    -1px 1px 0 #000;
+  line-height: 1;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+/* 右侧控制操作区 */
+.slot-controls-area {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
   gap: 6px;
 }
 
-.room-member-row {
+.slot-action-btn {
+  font-weight: 800 !important;
+  font-size: 11px !important;
+  min-width: 44px;
+  height: 22px !important;
+  padding: 0 6px !important;
+}
+
+.bot-badge {
+  font-size: 9px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: rgba(246, 239, 228, 0.65);
+  padding: 0 3px;
+  border-radius: 2px;
+  font-weight: 800;
+  transform: scale(0.9);
+  transform-origin: left center;
+}
+
+.offline-badge {
+  font-size: 9px;
+  background: rgba(213, 76, 76, 0.16);
+  border: 1px solid rgba(213, 76, 76, 0.4);
+  color: #d54c4c;
+  padding: 0 3px;
+  border-radius: 2px;
+  font-weight: 800;
+  transform: scale(0.9);
+  transform-origin: left center;
+}
+
+.start-battle-button {
+  font-weight: 800 !important;
+  box-shadow: 0 4px 12px rgba(201, 139, 90, 0.2);
+}
+
+.start-button-area {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.start-button-hint {
+  font-size: 11px;
+  color: rgba(246, 239, 228, 0.5);
+  padding-left: 2px;
+}
+
+.spectator-status-tag {
+  font-weight: 800;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+}
+
+/* 观战席面板样式 */
+.spectator-list-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(20, 18, 16, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 10px 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.spectator-list-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.03);
-  padding: 9px 10px;
+  cursor: pointer;
+  user-select: none;
 }
 
-.room-member-main {
-  display: grid;
-  grid-template-columns: 42px minmax(96px, max-content) max-content max-content max-content;
+.spectator-list-header .section-title {
+  margin: 0;
+}
+
+.panel-toggle-icon {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid rgba(246, 239, 228, 0.5);
+  flex-shrink: 0;
+  margin-left: 8px;
+  transition:
+    transform 0.2s ease,
+    border-top-color 0.15s ease;
+}
+
+.panel-toggle-icon.is-collapsed {
+  transform: rotate(-90deg);
+}
+
+.spectator-list-header:hover .panel-toggle-icon,
+.room-settings-header:hover .panel-toggle-icon {
+  border-top-color: rgba(246, 239, 228, 0.85);
+}
+
+.spectator-count {
+  font-size: 11px;
+  font-weight: normal;
+  color: rgba(246, 239, 228, 0.45);
+  margin-left: 4px;
+}
+
+.spectator-list-wrapper {
+  min-height: 0;
+}
+
+.spectator-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 观战人员的药丸标签 */
+.spectator-bubble-tag {
+  display: inline-flex;
   align-items: center;
-  gap: 7px;
-  min-width: 0;
+  gap: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  padding: 2px 8px;
+  font-size: 12px;
+  color: rgba(246, 239, 228, 0.82);
+  line-height: 1.2;
 }
 
-.room-member-main > :deep(.n-tag:first-child) {
-  justify-self: start;
+.spectator-bubble-tag:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
 }
 
-.room-member-name {
-  min-width: 96px;
+.spectator-name-text {
+  max-width: 80px;
   overflow: hidden;
-  color: rgba(246, 239, 228, 0.94);
-  font-weight: 700;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 观战剔除 X 按钮 */
+.spectator-kick-x {
+  background: transparent;
+  border: none;
+  color: rgba(213, 76, 76, 0.6);
+  cursor: pointer;
+  padding: 0;
+  font-size: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  transition: color 0.15s ease;
+}
+
+.spectator-kick-x:hover {
+  color: #d54c4c;
+}
+
+.spectator-empty-text {
+  font-size: 11px;
+  color: rgba(246, 239, 228, 0.35);
+  text-align: center;
+  padding: 6px 0;
+}
+
+/* 房间机制与设置面板 */
+.room-settings-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background: rgba(20, 18, 16, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 6px;
+  padding: 12px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
+
+.room-settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding-bottom: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.room-settings-header .section-title {
+  margin: 0;
+}
+
+.room-settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 扁平网格设置行 */
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  min-height: 24px;
+}
+
+.setting-label {
+  color: rgba(246, 239, 228, 0.75);
+  font-weight: 500;
+}
+
+.setting-label-block {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.setting-desc {
+  font-size: 10px;
+  color: rgba(246, 239, 228, 0.4);
+  line-height: 1.2;
+}
+
+.setting-input-number {
+  width: 90px;
+}
+
+.setting-select {
+  width: 130px;
 }
 
 .battle-main {
@@ -1706,14 +1677,63 @@ onBeforeUnmount(() => {
   bottom: 14px;
   z-index: 4;
   display: grid;
-  grid-template-columns: repeat(auto-fill, 28px);
-  grid-auto-rows: 45px;
+  grid-template-columns: repeat(auto-fill, 32px);
+  grid-auto-rows: 48px;
   justify-content: start;
   gap: 4px 5px;
-  width: min(236px, calc(100% - 28px));
-  max-height: 94px;
-  overflow: hidden;
+  width: min(272px, calc(100% - 28px));
   pointer-events: none;
+}
+
+.status-icon-cell {
+  position: relative;
+  display: block;
+  width: 32px;
+  height: 48px;
+}
+
+.status-icon {
+  display: block;
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.3);
+  box-sizing: border-box;
+}
+
+.status-countdown {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 800;
+  color: #ffffff;
+  text-shadow:
+    1px 1px 0 #000,
+    -1px -1px 0 #000,
+    1px -1px 0 #000,
+    -1px 1px 0 #000;
+  line-height: 1;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.status-icon-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  font-size: 10px;
+  font-weight: bold;
+  background: rgba(0, 0, 0, 0.6);
+  color: rgba(246, 239, 228, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  box-sizing: border-box;
 }
 
 .countdown-banner {
@@ -1749,9 +1769,12 @@ onBeforeUnmount(() => {
   min-height: 40px;
 }
 
-.stage-hint {
-  flex: 1;
-  min-width: 240px;
+.stage-mode-hint {
+  font-size: 10px;
+  color: rgba(246, 239, 228, 0.4);
+  max-width: 260px;
+  line-height: 1.3;
+  margin-left: 2px;
 }
 
 .result-card :deep(.n-card-content) {
@@ -1909,26 +1932,6 @@ onBeforeUnmount(() => {
   font-weight: 700;
 }
 
-.zoom-control {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 223, 177, 0.12);
-}
-
-.zoom-label {
-  font-size: 12px;
-  color: rgba(246, 239, 228, 0.72);
-  white-space: nowrap;
-}
-
-.zoom-input {
-  width: 88px;
-}
-
 .cast-overlay {
   position: absolute;
   top: 16px;
@@ -2017,5 +2020,99 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 8px;
   margin-top: 18px;
+}
+
+/* 观战提示遮罩 */
+.spectate-overlay-hint {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  background: rgba(10, 21, 23, 0.75);
+  border-radius: 4px;
+  padding: 3px 10px;
+  z-index: 10;
+  pointer-events: none;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(246, 239, 228, 0.7);
+}
+
+/* 观战提示中央大卡片与遮罩 */
+.spectator-welcome-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  animation: spectator-fade-in 0.25s ease-out;
+}
+
+.welcome-card {
+  width: 90%;
+  max-width: 300px;
+  background: rgba(24, 22, 20, 0.95);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 20px 24px;
+  text-align: center;
+  box-shadow:
+    0 20px 40px rgba(0, 0, 0, 0.6),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  animation: spectator-slide-up 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.welcome-title {
+  margin: 0 0 8px 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: #f6efe4;
+}
+
+.welcome-desc {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(246, 239, 228, 0.7);
+  line-height: 1.6;
+}
+
+/* Bot卡片去色调暗 */
+.slot-card.is-bot {
+  opacity: 0.65;
+}
+
+/* 房主 托管/清空切换按钮 */
+.slot-type-btn {
+  font-weight: 800 !important;
+  font-size: 10px !important;
+  height: 20px !important;
+  padding: 0 4px !important;
+  opacity: 0.8;
+}
+
+.slot-type-btn:hover {
+  opacity: 1;
+}
+
+@keyframes spectator-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes spectator-slide-up {
+  from {
+    transform: translateY(10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 </style>

@@ -6,6 +6,9 @@ import type {
   RoomRuntimeMetricsDto,
   ServerMetricsSnapshotDto,
 } from '@ff14arena/shared';
+import { useAppStore } from '../../stores/app';
+
+const appStore = useAppStore();
 
 const POLL_INTERVAL_MS = 2_000;
 
@@ -100,7 +103,7 @@ async function loadMetrics(): Promise<void> {
   errorMessage.value = null;
 
   try {
-    const response = await fetch('/admin/metrics', {
+    const response = await fetch(appStore.getApiUrl('/admin/metrics'), {
       cache: 'no-store',
     });
 

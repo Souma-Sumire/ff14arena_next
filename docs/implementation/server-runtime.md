@@ -73,7 +73,7 @@
 
 房主可以在观战状态开始倒计时。
 开始倒计时只要求当前连接属于房主、房间处于 `waiting` 且已选择战斗。
-倒计时默认为 `5s`，客户端可在 `room:start` 中携带 `countdownMs` 配置为 `1s` 到 `30s`。
+倒计时默认为 `3s`，客户端可在 `room:start` 中携带 `countdownMs` 配置为 `1s` 到 `30s`。
 支持跳时的战斗会在战斗静态数据中声明 `startTimeOptions`。房主可在 `room:start` 中携带 `startTimeMs`，服务端按固定 Tick 取整并校验范围；未携带时使用 `0ms`。未声明 `startTimeOptions` 的战斗只允许 `startTimeMs=0`，传入非零开始时间会返回 `invalid_start_time`。
 开始倒计时时，服务端先把等待态模拟重置为标准开场状态并清空上一轮结果。
 倒计时期间，服务端继续维持等待态移动同步，但不允许切换战斗、切换槽位、切换观战或新玩家加入战斗槽位。

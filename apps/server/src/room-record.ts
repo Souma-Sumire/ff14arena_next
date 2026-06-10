@@ -26,7 +26,12 @@ export interface BotSlotOccupant {
   name: string;
 }
 
-export type SlotOccupant = PlayerSlotOccupant | BotSlotOccupant;
+export interface EmptySlotOccupant {
+  type: 'empty';
+  actorId: string;
+}
+
+export type SlotOccupant = PlayerSlotOccupant | BotSlotOccupant | EmptySlotOccupant;
 
 export interface RoomSpectator {
   userId: string;
@@ -72,6 +77,19 @@ export function createBotOccupant(roomId: string, slot: PartySlot): BotSlotOccup
     actorId: `${roomId}:bot:${slot}`,
     name: `Bot ${slot}`,
   };
+}
+
+export function createEmptyOccupant(roomId: string, slot: PartySlot): EmptySlotOccupant {
+  return {
+    type: 'empty',
+    actorId: `${roomId}:empty:${slot}`,
+  };
+}
+
+export function createEmptySlots(roomId: string): Record<PartySlot, SlotOccupant> {
+  return Object.fromEntries(
+    PARTY_SLOT_ORDER.map((slot) => [slot, createEmptyOccupant(roomId, slot)]),
+  ) as Record<PartySlot, SlotOccupant>;
 }
 
 export function createFilledBotSlots(roomId: string): Record<PartySlot, SlotOccupant> {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Application, Assets, Graphics, Sprite, Text, TextStyle, Texture } from 'pixi.js';
-import { onBeforeUnmount, onMounted, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref, toRaw, watch } from 'vue';
 import type {
   ActorMarkerMechanicSnapshot,
   ActorMarkerShape,
@@ -90,6 +90,14 @@ let pendingYawDelta = 0;
 let dragUpdateFrame: number | null = null;
 let pendingZoomSteps = 0;
 let zoomUpdateFrame: number | null = null;
+let rawSnapshot: SimulationSnapshot | null = null;
+watch(
+  () => props.snapshot,
+  (val) => {
+    rawSnapshot = val ? toRaw(val) : null;
+  },
+  { immediate: true },
+);
 
 function clampZoom(zoom: number): number {
   return Math.min(Math.max(zoom, MIN_ZOOM), MAX_ZOOM);
@@ -106,11 +114,11 @@ function rotatePoint(point: Vector2, angle: number): Vector2 {
 }
 
 function getControlledActor() {
-  if (props.snapshot === null || props.controlledActorId === null) {
+  if (rawSnapshot === null || props.controlledActorId === null) {
     return null;
   }
 
-  return props.snapshot.actors.find((actor) => actor.id === props.controlledActorId) ?? null;
+  return rawSnapshot.actors.find((actor) => actor.id === props.controlledActorId) ?? null;
 }
 
 function getRenderActorState(actorId: string): RenderActorState | null {
@@ -546,7 +554,7 @@ function hideLabels(): void {
 }
 
 function syncRenderActors(): void {
-  const snapshot = props.snapshot;
+  const snapshot = rawSnapshot;
 
   if (snapshot === null) {
     renderActors.clear();
@@ -1169,7 +1177,7 @@ function draw(now: number): void {
   clearStage();
   syncRenderActors();
 
-  if (props.snapshot === null) {
+  if (rawSnapshot === null) {
     hideLabels();
     if (arenaBackgroundSprite !== null) {
       arenaBackgroundSprite.visible = false;
@@ -1179,7 +1187,7 @@ function draw(now: number): void {
 
   advanceRenderActors(deltaMs);
 
-  const { arenaRadius, bossTargetRingRadius } = props.snapshot;
+  const { arenaRadius, bossTargetRingRadius } = rawSnapshot;
   const scale = getWorldScale(width, height, arenaRadius);
   const arenaCenter = toStagePoint({ x: 0, y: 0 }, width, height, arenaRadius);
   const graphics = stageGraphics;
@@ -1188,12 +1196,12 @@ function draw(now: number): void {
     return;
   }
 
-  syncActorLabels(props.snapshot);
-  syncMapMarkerLabels(props.snapshot.mapMarkers);
-  syncActorMarkerTextLabels(props.snapshot);
-  syncFieldMarkerTextLabels(props.snapshot);
-  syncRingIndicatorQuestionLabels(props.snapshot);
-  const activeEnemyStageMarkers = getEnemyStageMarkers(props.snapshot);
+  syncActorLabels(rawSnapshot);
+  syncMapMarkerLabels(rawSnapshot.mapMarkers);
+  syncActorMarkerTextLabels(rawSnapshot);
+  syncFieldMarkerTextLabels(rawSnapshot);
+  syncRingIndicatorQuestionLabels(rawSnapshot);
+  const activeEnemyStageMarkers = getEnemyStageMarkers(rawSnapshot);
   const hasArenaBackground = updateArenaBackground(width, height, arenaRadius, scale);
 
   if (!hasArenaBackground) {
@@ -1213,11 +1221,11 @@ function draw(now: number): void {
     });
   }
 
-  for (const marker of props.snapshot.mapMarkers) {
+  for (const marker of rawSnapshot.mapMarkers) {
     drawMapMarker(graphics, marker, width, height, arenaRadius, scale);
   }
 
-  for (const stageActor of props.snapshot.stageActors) {
+  for (const stageActor of rawSnapshot.stageActors) {
     const point = toStagePoint(stageActor.center, width, height, arenaRadius);
     drawFieldMarker(
       graphics,
@@ -1247,14 +1255,14 @@ function draw(now: number): void {
     }
   }
 
-  for (const mechanic of props.snapshot.mechanics) {
+  for (const mechanic of rawSnapshot.mechanics) {
     if (mechanic.kind === 'tether') {
       const sourcePosition =
         mechanic.sourcePosition ??
-        (mechanic.sourceId === props.snapshot.boss.id
-          ? props.snapshot.boss.position
-          : props.snapshot.actors.find((actor) => actor.id === mechanic.sourceId)?.position);
-      const target = props.snapshot.actors.find((actor) => actor.id === mechanic.targetId);
+        (mechanic.sourceId === rawSnapshot.boss.id
+          ? rawSnapshot.boss.position
+          : rawSnapshot.actors.find((actor) => actor.id === mechanic.sourceId)?.position);
+      const target = rawSnapshot.actors.find((actor) => actor.id === mechanic.targetId);
 
       if (sourcePosition !== undefined && target !== undefined) {
         const sourcePoint = toStagePoint(sourcePosition, width, height, arenaRadius);
@@ -1268,7 +1276,7 @@ function draw(now: number): void {
     }
 
     if (mechanic.kind === 'actorMarker') {
-      const target = props.snapshot.actors.find((actor) => actor.id === mechanic.targetId);
+      const target = rawSnapshot.actors.find((actor) => actor.id === mechanic.targetId);
       const targetPosition =
         target === undefined ? null : (getRenderActorState(target.id)?.position ?? target.position);
 
@@ -1457,7 +1465,7 @@ function draw(now: number): void {
   }
 
   if (bossTargetRingRadius > 0) {
-    const bossPoint = toStagePoint(props.snapshot.boss.position, width, height, arenaRadius);
+    const bossPoint = toStagePoint(rawSnapshot.boss.position, width, height, arenaRadius);
     graphics.circle(bossPoint.x, bossPoint.y, 16).fill({ color: 0xf6c66a, alpha: 1 });
     graphics.circle(bossPoint.x, bossPoint.y, 20).stroke({
       width: 2,
@@ -1474,15 +1482,12 @@ function draw(now: number): void {
     bossLabel.visible = false;
   }
 
-  for (const actor of props.snapshot.actors) {
+  for (const actor of rawSnapshot.actors) {
     const renderState = getRenderActorState(actor.id);
     const renderPosition = renderState?.position ?? actor.position;
     const renderFacing = renderState?.facing ?? actor.facing;
     const point = toStagePoint(renderPosition, width, height, arenaRadius);
-    const color =
-      actor.slot === null
-        ? '#ffffff'
-        : getSlotColor(actor.slot, actor.id === props.controlledActorId);
+    const color = actor.slot === null ? '#ffffff' : getSlotColor(actor.slot);
     const numericColor = Number.parseInt(color.replace('#', ''), 16);
     const alpha = actor.alive ? 1 : 0.35;
 
@@ -1527,7 +1532,7 @@ function runRenderLoop(now: number): void {
 function handleMouseDown(event: MouseEvent): void {
   if (
     (event.button !== 0 && event.button !== 2) ||
-    props.snapshot === null ||
+    rawSnapshot === null ||
     props.operationMode === 'fixed'
   ) {
     return;

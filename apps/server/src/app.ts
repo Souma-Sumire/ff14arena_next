@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import fastifyStatic from '@fastify/static';
+import fastifyCors from '@fastify/cors';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { battleCatalog, getBattleStaticData } from '@ff14arena/content';
 import { Server } from 'socket.io';
@@ -87,11 +88,15 @@ export function createServerContext(options?: ServerContextOptions): ServerConte
   const app = Fastify({
     logger: options?.logger ?? true,
   });
+  app.register(fastifyCors, {
+    origin: '*',
+  });
   const staticRoot = resolveStaticRoot(options?.staticRoot);
 
   const io = new Server<ClientToServerEvents, ServerToClientEvents>(app.server, {
     cors: {
-      origin: true,
+      origin: '*',
+      methods: ['GET', 'POST'],
     },
   });
   const metrics = new ServerMetricsCollector();
@@ -265,9 +270,19 @@ export function createServerContext(options?: ServerContextOptions): ServerConte
       roomManager.quickFail(socket, payload.roomId);
     });
 
+    socket.on('room:reset', (payload) => {
+      metrics.recordSocketInbound('room:reset');
+      roomManager.resetRoom(socket, payload.roomId);
+    });
+
     socket.on('room:kick', (payload) => {
       metrics.recordSocketInbound('room:kick');
       roomManager.kickMember(socket, payload);
+    });
+
+    socket.on('room:set-slot-occupant', (payload) => {
+      metrics.recordSocketInbound('room:set-slot-occupant');
+      roomManager.setSlotOccupant(socket, payload);
     });
 
     socket.on('sim:input-frame', (payload) => {
@@ -283,6 +298,49 @@ export function createServerContext(options?: ServerContextOptions): ServerConte
     socket.on('sim:use-sprint', (payload) => {
       metrics.recordSocketInbound('sim:use-sprint');
       roomManager.enqueueInput(socket, payload);
+    });
+
+    socket.on('lobby:get-data', () => {
+      metrics.recordSocketInbound('lobby:get-data');
+      socket.emit('lobby:data', {
+        roomPasswordRequired: roomManager.isRoomPasswordRequired(),
+        battles: battleCatalog,
+        rooms: roomManager.listRooms(),
+      });
+    });
+
+    socket.on('room:create', (payload, callback) => {
+      metrics.recordSocketInbound('room:create');
+      try {
+        if (!payload.name || !payload.ownerUserId || !payload.ownerName) {
+          callback({ success: false, message: 'name、ownerUserId、ownerName 为必填项' });
+          return;
+        }
+
+        if (!roomManager.validateRoomPassword(payload.password)) {
+          callback({
+            success: false,
+            code: 'invalid_room_password',
+            message: '房间密码错误',
+          });
+          return;
+        }
+
+        const createPayload = {
+          name: payload.name,
+          ownerUserId: payload.ownerUserId,
+          ownerName: payload.ownerName,
+          ...(payload.battleId ? { battleId: payload.battleId } : {}),
+        };
+
+        const roomDto = roomManager.createPendingRoom(createPayload);
+        callback({ success: true, roomId: roomDto.roomId });
+      } catch (err) {
+        callback({
+          success: false,
+          message: err instanceof Error ? err.message : '创建房间失败',
+        });
+      }
     });
 
     socket.on('sim:request-resync', (payload) => {

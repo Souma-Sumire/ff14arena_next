@@ -1,6 +1,13 @@
 import type { PartySlot } from './base';
+import type { BattleSummary } from './battle';
 import type { RealtimeBinaryPayload, RealtimeEncoding } from './realtime-codec';
-import type { RoomMechanicOptions, RoomRuleOptions, RoomSlotState, RoomStateDto } from './room';
+import type {
+  RoomMechanicOptions,
+  RoomRuleOptions,
+  RoomSlotState,
+  RoomStateDto,
+  RoomSummaryDto,
+} from './room';
 import type {
   ContinuousSimulationInputFrame,
   EncounterResult,
@@ -48,9 +55,19 @@ export interface RoomQuickFailPayload {
   roomId: string;
 }
 
+export interface RoomResetPayload {
+  roomId: string;
+}
+
 export interface RoomKickPayload {
   roomId: string;
   targetUserId: string;
+}
+
+export interface RoomSetSlotOccupantPayload {
+  roomId: string;
+  slot: PartySlot;
+  occupantType: 'empty' | 'bot';
 }
 
 export interface RoomUpdateOptionsPayload {
@@ -92,6 +109,20 @@ export interface SimEventsPayload {
   events: SimulationEvent[];
 }
 
+export interface ActorPoseDiff {
+  slotIndex: number;
+  x: number;
+  y: number;
+  facing: number;
+}
+
+export interface SimPoseDiffPayload {
+  roomId: string;
+  tick: number;
+  timeMs: number;
+  poses: ActorPoseDiff[];
+}
+
 export interface SimEndPayload {
   roomId: string;
   latestResult: EncounterResult;
@@ -117,6 +148,27 @@ export interface ServerErrorPayload {
   message: string;
 }
 
+export interface LobbyDataPayload {
+  roomPasswordRequired: boolean;
+  battles: BattleSummary[];
+  rooms: RoomSummaryDto[];
+}
+
+export interface RoomCreatePayload {
+  name: string;
+  ownerUserId: string;
+  ownerName: string;
+  battleId?: string;
+  password?: string;
+}
+
+export interface RoomCreateResponse {
+  success: boolean;
+  roomId?: string;
+  code?: string;
+  message?: string;
+}
+
 export interface ServerToClientEvents {
   'room:state': (payload: RoomStatePayload) => void;
   'room:slots': (payload: RoomSlotsPayload) => void;
@@ -124,10 +176,12 @@ export interface ServerToClientEvents {
   'sim:start': (payload: SimStartPayload | RealtimeBinaryPayload) => void;
   'sim:snapshot': (payload: SimSnapshotPayload | RealtimeBinaryPayload) => void;
   'sim:events': (payload: SimEventsPayload | RealtimeBinaryPayload) => void;
+  'sim:pose-diff': (payload: SimPoseDiffPayload | RealtimeBinaryPayload) => void;
   'sim:end': (payload: SimEndPayload) => void;
   'room:closed': (payload: RoomClosedPayload) => void;
   'room:kicked': (payload: RoomKickedPayload) => void;
   'server:error': (payload: ServerErrorPayload) => void;
+  'lobby:data': (payload: LobbyDataPayload) => void;
 }
 
 export interface ClientToServerEvents {
@@ -139,9 +193,16 @@ export interface ClientToServerEvents {
   'room:start': (payload: RoomStartPayload) => void;
   'room:update-options': (payload: RoomUpdateOptionsPayload) => void;
   'room:quick-fail': (payload: RoomQuickFailPayload) => void;
+  'room:reset': (payload: RoomResetPayload) => void;
   'room:kick': (payload: RoomKickPayload) => void;
   'sim:input-frame': (payload: ContinuousSimulationInputFrame | RealtimeBinaryPayload) => void;
   'sim:use-knockback-immune': (payload: UseKnockbackImmuneSimulationInput) => void;
   'sim:use-sprint': (payload: UseSprintSimulationInput) => void;
   'sim:request-resync': (payload: SimResyncRequestPayload) => void;
+  'lobby:get-data': () => void;
+  'room:create': (
+    payload: RoomCreatePayload,
+    callback: (response: RoomCreateResponse) => void,
+  ) => void;
+  'room:set-slot-occupant': (payload: RoomSetSlotOccupantPayload) => void;
 }

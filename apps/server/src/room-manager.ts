@@ -1,4 +1,4 @@
-import { getBattleBotController, getBattleDefinition } from '@ff14arena/content';
+import { battleCatalog, getBattleBotController, getBattleDefinition } from '@ff14arena/content';
 import { createSimulation, FIXED_TICK_MS } from '@ff14arena/core';
 import { performance } from 'node:perf_hooks';
 import type { Server as SocketServer, Socket } from 'socket.io';
@@ -23,12 +23,15 @@ import type {
   SimulationSnapshot,
   UseKnockbackImmuneSimulationInput,
   UseSprintSimulationInput,
+  ActorPoseDiff,
+  SimPoseDiffPayload,
 } from '@ff14arena/shared';
 import {
   decodeContinuousInputFrame,
   encodeSimEventsPayload,
   encodeSimSnapshotPayload,
   encodeSimStartPayload,
+  encodeSimPoseDiffPayload,
   PARTY_SLOT_ORDER,
 } from '@ff14arena/shared';
 import { ServerMetricsCollector, type RoomMetricDescriptor } from './metrics';
@@ -41,7 +44,8 @@ import {
 } from './room-presenter';
 import {
   createBotOccupant,
-  createFilledBotSlots,
+  createEmptyOccupant,
+  createEmptySlots,
   type PlayerSlotOccupant,
   type RoomRecord,
   type RoomSpectator,
@@ -49,7 +53,7 @@ import {
 
 type TypedSocket = Socket<ClientToServerEvents, ServerToClientEvents>;
 type TypedIo = SocketServer<ClientToServerEvents, ServerToClientEvents>;
-const DEFAULT_START_COUNTDOWN_MS = 5_000;
+const DEFAULT_START_COUNTDOWN_MS = 3_000;
 const MIN_START_COUNTDOWN_MS = 1_000;
 const MAX_START_COUNTDOWN_MS = 30_000;
 const PENDING_ROOM_TTL_MS = 30_000;
@@ -209,7 +213,7 @@ export class RoomManager {
       phase: 'waiting',
       battleId: pendingRoom.battleId,
       battle: pendingRoom.battle,
-      slots: createFilledBotSlots(pendingRoom.roomId),
+      slots: createEmptySlots(pendingRoom.roomId),
       spectators: new Map(),
       simulation: null,
       loopHandle: null,
@@ -337,8 +341,8 @@ export class RoomManager {
 
   private emitRealtimePayload(
     room: RoomRecord,
-    eventName: 'sim:start' | 'sim:snapshot' | 'sim:events',
-    jsonPayload: SimStartPayload | SimSnapshotPayload | SimEventsPayload,
+    eventName: 'sim:start' | 'sim:snapshot' | 'sim:events' | 'sim:pose-diff',
+    jsonPayload: SimStartPayload | SimSnapshotPayload | SimEventsPayload | SimPoseDiffPayload,
     protobufPayload: Uint8Array,
     options?: {
       target?: TypedSocket;
@@ -365,6 +369,16 @@ export class RoomManager {
             target.volatile.emit('sim:events', payload as SimEventsPayload | RealtimeBinaryPayload);
           } else {
             target.emit('sim:events', payload as SimEventsPayload | RealtimeBinaryPayload);
+          }
+          break;
+        case 'sim:pose-diff':
+          if (options?.volatile === true) {
+            target.volatile.emit(
+              'sim:pose-diff',
+              payload as SimPoseDiffPayload | RealtimeBinaryPayload,
+            );
+          } else {
+            target.emit('sim:pose-diff', payload as SimPoseDiffPayload | RealtimeBinaryPayload);
           }
           break;
       }
@@ -444,9 +458,57 @@ export class RoomManager {
     room.simulation.tick(FIXED_TICK_MS);
     const simulationTickDurationMs = performance.now() - simulationTickStartedAt;
     room.snapshotBroadcastCounter += 1;
-    const events = room.simulation.drainEvents();
+    const rawEvents = room.simulation.drainEvents();
+    const poseDiffs: ActorPoseDiff[] = [];
+    const logicEvents: SimulationEvent[] = [];
+    const currentSnapshot = room.simulation.getSnapshot();
 
-    this.emitSimulationEvents(room, events);
+    for (const event of rawEvents) {
+      if (event.type === 'actorMoved') {
+        const actorId = event.payload.actorId;
+        let slotIndex = -1;
+        if (currentSnapshot !== undefined && currentSnapshot !== null) {
+          if (actorId === currentSnapshot.boss.id) {
+            slotIndex = 8;
+          } else {
+            const actor = currentSnapshot.actors.find((a) => a.id === actorId);
+            if (actor !== undefined && actor.slot !== null) {
+              slotIndex = PARTY_SLOT_ORDER.indexOf(actor.slot);
+            }
+          }
+        }
+
+        if (slotIndex !== -1) {
+          poseDiffs.push({
+            slotIndex,
+            x: event.payload.position.x,
+            y: event.payload.position.y,
+            facing: event.payload.facing,
+          });
+        }
+      } else {
+        logicEvents.push(event);
+      }
+    }
+
+    this.emitSimulationEvents(room, logicEvents);
+
+    if (poseDiffs.length > 0 && room.phase === 'running') {
+      const posePayload: SimPoseDiffPayload = {
+        roomId: room.roomId,
+        tick: currentSnapshot?.tick ?? 0,
+        timeMs: currentSnapshot?.timeMs ?? 0,
+        poses: poseDiffs,
+      };
+      this.emitRealtimePayload(
+        room,
+        'sim:pose-diff',
+        posePayload,
+        encodeSimPoseDiffPayload(posePayload),
+        { volatile: true },
+      );
+      this.metrics?.recordSocketOutbound('sim:pose-diff');
+    }
 
     if (room.snapshotBroadcastCounter >= SNAPSHOT_BROADCAST_INTERVAL_TICKS) {
       room.snapshotBroadcastCounter = 0;
@@ -526,6 +588,7 @@ export class RoomManager {
         });
       }
 
+      this.broadcastLobbyData();
       return;
     }
 
@@ -551,6 +614,7 @@ export class RoomManager {
         });
       }
 
+      this.broadcastLobbyData();
       return;
     }
 
@@ -575,6 +639,7 @@ export class RoomManager {
       socket.join(room.roomId);
       this.setRealtimeEncoding(socket, room, payload);
       this.broadcastWaitingState(room, 'join');
+      this.broadcastLobbyData();
       return;
     }
 
@@ -608,6 +673,7 @@ export class RoomManager {
       keepTimeMs: true,
     });
     this.broadcastWaitingState(room, 'join');
+    this.broadcastLobbyData();
   }
 
   leaveRoom(socket: TypedSocket, roomId: string): void {
@@ -628,11 +694,13 @@ export class RoomManager {
         this.handleSpectatorDeparture(room, spectator, true);
       }
 
+      this.broadcastLobbyData();
       return;
     }
 
     socket.leave(room.roomId);
     this.handlePlayerDeparture(room, slot, true);
+    this.broadcastLobbyData();
   }
 
   handleDisconnect(socketId: string): void {
@@ -645,6 +713,7 @@ export class RoomManager {
         if (spectator !== undefined) {
           room.realtimeEncodingBySocketId.delete(socketId);
           this.handleSpectatorDeparture(room, spectator, false);
+          this.broadcastLobbyData();
           return;
         }
 
@@ -653,6 +722,7 @@ export class RoomManager {
 
       room.realtimeEncodingBySocketId.delete(socketId);
       this.handlePlayerDeparture(room, slot, false);
+      this.broadcastLobbyData();
       return;
     }
   }
@@ -675,12 +745,28 @@ export class RoomManager {
       return;
     }
 
+    const room = this.instantiatePendingRoom(pendingRoom);
+
     if (payload.mode === 'spectator') {
-      this.emitError(socket, 'owner_must_join_as_player', '房主需要先加入战斗槽位');
+      room.spectators.set(payload.userId, {
+        userId: payload.userId,
+        name: userName,
+        socketId: socket.id,
+        online: true,
+      });
+      this.userRooms.set(payload.userId, room.roomId);
+      socket.join(room.roomId);
+      this.setRealtimeEncoding(socket, room, payload);
+      this.rebuildWaitingSimulation(room, {
+        resetAllActors: true,
+        keepTimeMs: false,
+        sourceSnapshot: null,
+      });
+      this.broadcastWaitingState(room, 'join');
+      this.broadcastLobbyData();
       return;
     }
 
-    const room = this.instantiatePendingRoom(pendingRoom);
     const targetSlot = payload.slot ?? this.findFirstAvailableSlot(room);
 
     if (targetSlot === undefined || room.slots[targetSlot].type === 'player') {
@@ -708,6 +794,7 @@ export class RoomManager {
       sourceSnapshot: null,
     });
     this.broadcastWaitingState(room, 'join');
+    this.broadcastLobbyData();
   }
 
   selectBattle(socket: TypedSocket, roomId: string, battleId: string): void {
@@ -818,14 +905,17 @@ export class RoomManager {
     const currentOccupant = room.slots[currentSlot];
     const targetOccupant = room.slots[payload.targetSlot];
 
-    if (targetOccupant.type === 'bot') {
-      const nextBotOccupant = createBotOccupant(room.roomId, currentSlot);
-      room.slots[currentSlot] = nextBotOccupant;
+    if (targetOccupant.type === 'bot' || targetOccupant.type === 'empty') {
+      const nextOccupant =
+        targetOccupant.type === 'bot'
+          ? createBotOccupant(room.roomId, currentSlot)
+          : createEmptyOccupant(room.roomId, currentSlot);
+      room.slots[currentSlot] = nextOccupant;
       room.slots[payload.targetSlot] = currentOccupant;
       this.rebuildWaitingSimulation(room, {
         sourceSnapshot: room.simulation?.getSnapshot() ?? null,
         keepTimeMs: true,
-        resetPositionActorIds: new Set([currentOccupant.actorId, nextBotOccupant.actorId]),
+        resetPositionActorIds: new Set([currentOccupant.actorId, nextOccupant.actorId]),
       });
       this.broadcastWaitingState(room, 'waiting-state');
       return;
@@ -877,7 +967,7 @@ export class RoomManager {
       socketId: occupant.socketId,
       online: occupant.online,
     });
-    room.slots[currentSlot] = createBotOccupant(room.roomId, currentSlot);
+    room.slots[currentSlot] = createEmptyOccupant(room.roomId, currentSlot);
     this.rebuildWaitingSimulation(room, {
       sourceSnapshot: room.simulation?.getSnapshot() ?? null,
       keepTimeMs: true,
@@ -913,6 +1003,12 @@ export class RoomManager {
 
     if (room.startCountdown !== null) {
       this.emitError(socket, 'start_countdown_active', '开始倒计时已在进行中');
+      return;
+    }
+
+    const hasEmptySlot = PARTY_SLOT_ORDER.some((slot) => room.slots[slot].type === 'empty');
+    if (hasEmptySlot) {
+      this.emitError(socket, 'has_empty_slots', '小队尚未满员，需填入玩家或设置为电脑以开始模拟');
       return;
     }
 
@@ -1083,6 +1179,53 @@ export class RoomManager {
     this.emitError(socket, 'member_not_found', '目标成员不在房间内');
   }
 
+  setSlotOccupant(
+    socket: TypedSocket,
+    payload: { roomId: string; slot: PartySlot; occupantType: 'empty' | 'bot' },
+  ): void {
+    const room = this.rooms.get(payload.roomId);
+
+    if (room === undefined) {
+      this.emitError(socket, 'room_not_found', '房间不存在');
+      return;
+    }
+
+    const occupant = this.getRoomMemberBySocket(room, socket.id);
+
+    if (occupant?.userId !== room.ownerUserId) {
+      this.emitError(socket, 'not_owner', '只有房主可以更改槽位角色');
+      return;
+    }
+
+    if (room.phase !== 'waiting') {
+      this.emitError(socket, 'room_not_waiting', '当前房间状态不允许更改槽位角色');
+      return;
+    }
+
+    if (room.startCountdown !== null) {
+      this.emitError(socket, 'start_countdown_active', '倒计时期间不允许更改槽位角色');
+      return;
+    }
+
+    const targetOccupant = room.slots[payload.slot];
+    if (targetOccupant.type === 'player') {
+      this.emitError(socket, 'slot_occupied', '该槽位已被玩家占用，请先踢出玩家');
+      return;
+    }
+
+    if (payload.occupantType === 'bot') {
+      room.slots[payload.slot] = createBotOccupant(room.roomId, payload.slot);
+    } else {
+      room.slots[payload.slot] = createEmptyOccupant(room.roomId, payload.slot);
+    }
+
+    this.rebuildWaitingSimulation(room, {
+      sourceSnapshot: room.simulation?.getSnapshot() ?? null,
+      keepTimeMs: true,
+    });
+    this.broadcastWaitingState(room, 'waiting-state');
+  }
+
   enqueueInput(
     socket: TypedSocket,
     input: UseKnockbackImmuneSimulationInput | UseSprintSimulationInput,
@@ -1224,7 +1367,7 @@ export class RoomManager {
       if (shouldLeaveRoom) {
         this.clearDisconnectedPlayerCleanup(room.roomId, occupant.userId);
         this.userRooms.delete(occupant.userId);
-        room.slots[slot] = createBotOccupant(room.roomId, slot);
+        room.slots[slot] = createEmptyOccupant(room.roomId, slot);
       } else {
         occupant.online = false;
         occupant.socketId = null;
@@ -1277,7 +1420,7 @@ export class RoomManager {
     this.emitMemberKicked(room, occupant.socketId);
     this.clearDisconnectedPlayerCleanup(room.roomId, occupant.userId);
     this.userRooms.delete(occupant.userId);
-    room.slots[slot] = createBotOccupant(room.roomId, slot);
+    room.slots[slot] = createEmptyOccupant(room.roomId, slot);
     this.rebuildWaitingSimulation(room, {
       sourceSnapshot: room.simulation?.getSnapshot() ?? null,
       keepTimeMs: true,
@@ -1408,6 +1551,35 @@ export class RoomManager {
     this.emitRoomSlots(room);
   }
 
+  resetRoom(socket: TypedSocket, roomId: string): void {
+    const room = this.rooms.get(roomId);
+
+    if (room === undefined) {
+      this.emitError(socket, 'room_not_found', '房间不存在');
+      return;
+    }
+
+    const occupant = this.getRoomMemberBySocket(room, socket.id);
+
+    if (occupant?.userId !== room.ownerUserId) {
+      this.emitError(socket, 'not_owner', '只有房主可以重置模拟');
+      return;
+    }
+
+    if (room.phase !== 'running' && room.phase !== 'waiting') {
+      this.emitError(socket, 'room_not_resettable', '当前房间状态无法重置');
+      return;
+    }
+
+    room.latestResult = null;
+    room.syncId += 1;
+    this.resetPoseSyncState(room);
+    this.rebuildWaitingSimulation(room, {
+      resetAllActors: true,
+    });
+    this.broadcastWaitingState(room, 'battle-end');
+  }
+
   private finishSimulation(room: RoomRecord, endSnapshot: SimulationSnapshot): void {
     room.phase = 'waiting';
     room.latestResult = endSnapshot.latestResult;
@@ -1419,7 +1591,7 @@ export class RoomManager {
       const occupant = room.slots[slot];
 
       if (occupant.type === 'player' && occupant.departed) {
-        room.slots[slot] = createBotOccupant(room.roomId, slot);
+        room.slots[slot] = createEmptyOccupant(room.roomId, slot);
         resetActorIds.add(room.slots[slot].actorId);
       }
     }
@@ -1640,7 +1812,7 @@ export class RoomManager {
       }
 
       this.userRooms.delete(userId);
-      liveRoom.slots[slot] = createBotOccupant(liveRoom.roomId, slot);
+      liveRoom.slots[slot] = createEmptyOccupant(liveRoom.roomId, slot);
       this.rebuildWaitingSimulation(liveRoom, {
         sourceSnapshot: liveRoom.simulation?.getSnapshot() ?? null,
         keepTimeMs: true,
@@ -1677,6 +1849,14 @@ export class RoomManager {
     this.disconnectedSpectatorCleanupHandles.set(key, handle);
   }
 
+  private broadcastLobbyData(): void {
+    this.io.emit('lobby:data', {
+      roomPasswordRequired: this.isRoomPasswordRequired(),
+      battles: battleCatalog,
+      rooms: this.listRooms(),
+    });
+  }
+
   private closeRoom(roomId: string, reason: string): void {
     const room = this.rooms.get(roomId);
 
@@ -1711,6 +1891,7 @@ export class RoomManager {
 
     this.rooms.delete(roomId);
     this.metrics?.recordRoomClosed(roomId);
+    this.broadcastLobbyData();
   }
 
   private emitError(socket: TypedSocket, code: string, message: string): void {

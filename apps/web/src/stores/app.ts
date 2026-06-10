@@ -1,4 +1,5 @@
-import { computed, ref, shallowRef } from 'vue';
+import { computed, ref, shallowRef, triggerRef, watch } from 'vue';
+import type { MessageApi } from 'naive-ui';
 import { defineStore } from 'pinia';
 import type { Socket } from 'socket.io-client';
 import {
@@ -26,12 +27,15 @@ import type {
   SimulationInput,
   SimulationSnapshot,
   Vector2,
+  RoomCreateResponse,
 } from '@ff14arena/shared';
 import {
   decodeSimEventsPayload,
   decodeSimSnapshotPayload,
   decodeSimStartPayload,
   encodeContinuousInputFrame,
+  decodeSimPoseDiffPayload,
+  PARTY_SLOT_ORDER,
 } from '@ff14arena/shared';
 import { normalizeAngleDifference } from '../utils/angle';
 import { loadProfile, saveProfile, type LocalProfile } from './profile';
@@ -110,6 +114,18 @@ function clearCachedRoomPassword(): void {
 }
 
 export const useAppStore = defineStore('app', () => {
+  function disconnect(): void {
+    if (socket.value !== null) {
+      socket.value.disconnect();
+      socket.value = null;
+      socketPromise.value = null;
+    }
+    connected.value = false;
+    stopTransportProbeLoop();
+    clearLocalControlState();
+    appendLog('手动断开连接');
+  }
+
   const profile = ref<LocalProfile>(loadProfile());
   const socket = shallowRef<AppSocket | null>(null);
   const socketPromise = shallowRef<Promise<AppSocket> | null>(null);
@@ -117,7 +133,7 @@ export const useAppStore = defineStore('app', () => {
   const battleStaticDataById = ref(new Map<string, BattleStaticData>());
   const rooms = ref<RoomSummaryDto[]>([]);
   const room = ref<RoomStateDto | null>(null);
-  const authoritativeSnapshot = ref<SimulationSnapshot | null>(null);
+  const authoritativeSnapshot = shallowRef<SimulationSnapshot | null>(null);
   const serverError = ref<string | null>(null);
   const statusIconPreloadError = ref<string | null>(null);
   const failedStatusIconUrls = ref<string[]>([]);
@@ -228,15 +244,15 @@ export const useAppStore = defineStore('app', () => {
   }
 
   async function loadLobbyData(): Promise<void> {
-    const [authConfigResponse, battleResponse, roomResponse] = await Promise.all([
-      fetchJson<{ roomPasswordRequired: boolean }>('/auth-config'),
-      fetchJson<{ battles: BattleSummary[] }>('/battles'),
-      fetchJson<{ rooms: RoomSummaryDto[] }>('/rooms'),
-    ]);
-
-    roomPasswordRequired.value = authConfigResponse.roomPasswordRequired;
-    battles.value = battleResponse.battles;
-    rooms.value = roomResponse.rooms;
+    try {
+      const currentSocket = await ensureSocket();
+      currentSocket.emit('lobby:get-data');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '加载大厅数据失败';
+      serverError.value = message;
+      appendLog(`错误：${message}`);
+      throw error;
+    }
   }
 
   function appendLog(message: string): void {
@@ -397,6 +413,8 @@ export const useAppStore = defineStore('app', () => {
     return actor;
   }
 
+  const latencyHistory: number[] = [];
+
   async function probeTransportLatency(): Promise<void> {
     const startedAt = performance.now();
 
@@ -412,12 +430,13 @@ export const useAppStore = defineStore('app', () => {
       await response.arrayBuffer();
       const latencyMs = performance.now() - startedAt;
 
-      if (transportProbeLatencyMs.value === 0) {
-        transportProbeLatencyMs.value = latencyMs;
-        return;
+      latencyHistory.push(latencyMs);
+      if (latencyHistory.length > 3) {
+        latencyHistory.shift();
       }
 
-      transportProbeLatencyMs.value = transportProbeLatencyMs.value * 0.65 + latencyMs * 0.35;
+      const sum = latencyHistory.reduce((a, b) => a + b, 0);
+      transportProbeLatencyMs.value = sum / latencyHistory.length;
     } catch {
       // 忽略探测失败，保留最近一次成功值。
     }
@@ -674,6 +693,12 @@ export const useAppStore = defineStore('app', () => {
       const nextSocket = io({
         transports: ['websocket'],
       }) as AppSocket;
+      nextSocket.on('lobby:data', (payload) => {
+        roomPasswordRequired.value = payload.roomPasswordRequired;
+        battles.value = payload.battles;
+        rooms.value = payload.rooms;
+        serverError.value = null;
+      });
 
       nextSocket.on('connect', () => {
         connected.value = true;
@@ -820,6 +845,49 @@ export const useAppStore = defineStore('app', () => {
         });
       });
 
+      nextSocket.on('sim:pose-diff', (rawPayload) => {
+        const payload = isRealtimeBinaryPayload(rawPayload)
+          ? decodeSimPoseDiffPayload(rawPayload)
+          : rawPayload;
+
+        if (room.value?.roomId !== payload.roomId) {
+          return;
+        }
+
+        if (authoritativeSnapshot.value === null) {
+          return;
+        }
+
+        if (payload.tick < authoritativeSnapshot.value.tick) {
+          return;
+        }
+
+        for (const pose of payload.poses) {
+          if (pose.slotIndex === 8) {
+            authoritativeSnapshot.value.boss.position = { x: pose.x, y: pose.y };
+            authoritativeSnapshot.value.boss.facing = pose.facing;
+          } else if (pose.slotIndex >= 0 && pose.slotIndex < 8) {
+            const slot = PARTY_SLOT_ORDER[pose.slotIndex];
+            const actor = authoritativeSnapshot.value.actors.find(
+              (candidate) => candidate.slot === slot,
+            );
+            if (actor !== undefined) {
+              if (actor.id === localControlledPose.value?.actorId) {
+                continue;
+              }
+              actor.position = { x: pose.x, y: pose.y };
+              actor.facing = pose.facing;
+            }
+          }
+        }
+
+        authoritativeSnapshot.value.tick = payload.tick;
+        authoritativeSnapshot.value.timeMs = payload.timeMs;
+        applyLocalControlledPose(authoritativeSnapshot.value);
+        reconcileFacingPreview(authoritativeSnapshot.value);
+        triggerRef(authoritativeSnapshot);
+      });
+
       nextSocket.on('sim:events', (rawPayload) => {
         const payload = isRealtimeBinaryPayload(rawPayload)
           ? decodeSimEventsPayload(rawPayload)
@@ -858,6 +926,7 @@ export const useAppStore = defineStore('app', () => {
         authoritativeSnapshot.value.timeMs = latestEvent.timeMs;
         applyLocalControlledPose(authoritativeSnapshot.value);
         reconcileFacingPreview(authoritativeSnapshot.value);
+        triggerRef(authoritativeSnapshot);
       });
 
       nextSocket.on('sim:end', (payload) => {
@@ -909,26 +978,40 @@ export const useAppStore = defineStore('app', () => {
     }
 
     try {
-      await ensureSocket();
+      const nextSocket = await ensureSocket();
       resetBattleState();
       room.value = null;
 
-      const response = await fetchJson<{ roomId: string; expiresAt: number }>('/rooms', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          name,
-          ownerUserId: profile.value.userId,
-          ownerName: profile.value.userName,
-          ...getRoomPasswordPayload(),
-          battleId,
-        }),
+      const createResponse = await new Promise<RoomCreateResponse>((resolve, reject) => {
+        nextSocket.emit(
+          'room:create',
+          {
+            name,
+            ownerUserId: profile.value.userId,
+            ownerName: profile.value.userName,
+            ...getRoomPasswordPayload(),
+            battleId,
+          },
+          (res: RoomCreateResponse) => {
+            resolve(res);
+          },
+        );
+
+        setTimeout(() => {
+          reject(new Error('创建房间超时'));
+        }, 5000);
       });
 
-      const roomStatePromise = waitForRoomState(response.roomId);
-      await joinRoom(response.roomId);
+      if (!createResponse.success || !createResponse.roomId) {
+        throw new HttpError(
+          createResponse.message || '创建房间失败',
+          createResponse.code === 'invalid_room_password' ? 403 : 400,
+          createResponse.code,
+        );
+      }
+
+      const roomStatePromise = waitForRoomState(createResponse.roomId);
+      await joinRoom(createResponse.roomId);
       await roomStatePromise;
       loadLobbyData().catch(() => undefined);
     } catch (error) {
@@ -948,13 +1031,13 @@ export const useAppStore = defineStore('app', () => {
   async function joinRoom(
     roomId: string,
     slot?: PartySlot,
-    mode?: 'player' | 'spectator',
+    mode: 'player' | 'spectator' = 'spectator',
   ): Promise<void> {
     const action: RoomEntryAction = {
       type: 'join',
       roomId,
       ...(slot !== undefined ? { slot } : {}),
-      ...(mode !== undefined ? { mode } : {}),
+      mode,
     };
 
     if (!prepareRoomEntryAction(action)) {
@@ -1053,6 +1136,33 @@ export const useAppStore = defineStore('app', () => {
     const currentSocket = socket.value ?? (await ensureSocket());
     currentSocket.emit('room:quick-fail', {
       roomId: room.value.roomId,
+    });
+  }
+
+  async function resetBattle(): Promise<void> {
+    if (room.value === null) {
+      return;
+    }
+
+    const currentSocket = socket.value ?? (await ensureSocket());
+    currentSocket.emit('room:reset', {
+      roomId: room.value.roomId,
+    });
+  }
+
+  async function setSlotOccupant(payload: {
+    slot: PartySlot;
+    occupantType: 'empty' | 'bot';
+  }): Promise<void> {
+    if (room.value === null) {
+      return;
+    }
+
+    const currentSocket = socket.value ?? (await ensureSocket());
+    currentSocket.emit('room:set-slot-occupant', {
+      roomId: room.value.roomId,
+      slot: payload.slot,
+      occupantType: payload.occupantType,
     });
   }
 
@@ -1523,7 +1633,58 @@ export const useAppStore = defineStore('app', () => {
     }
   }
 
+  const messageApi = ref<MessageApi | null>(null);
+
+  function setMessageApi(api: MessageApi): void {
+    messageApi.value = api;
+  }
+
+  function getRoomUsers(roomState: RoomStateDto): Map<string, string> {
+    const users = new Map<string, string>();
+    if (!roomState) return users;
+
+    for (const slotState of roomState.slots) {
+      if (slotState.occupantType === 'player' && slotState.ownerUserId && slotState.name) {
+        users.set(slotState.ownerUserId, slotState.name);
+      }
+    }
+
+    for (const spec of roomState.spectators) {
+      if (spec.userId && spec.name) {
+        users.set(spec.userId, spec.name);
+      }
+    }
+
+    return users;
+  }
+
+  watch(room, (newVal, oldVal) => {
+    if (!oldVal || !newVal || oldVal.roomId !== newVal.roomId) {
+      return;
+    }
+
+    const oldUsers = getRoomUsers(oldVal);
+    const newUsers = getRoomUsers(newVal);
+
+    for (const [userId, name] of newUsers.entries()) {
+      if (userId === profile.value.userId) continue;
+
+      if (!oldUsers.has(userId)) {
+        messageApi.value?.info(`玩家 ${name} 进入了房间`);
+      }
+    }
+
+    for (const [userId, name] of oldUsers.entries()) {
+      if (userId === profile.value.userId) continue;
+
+      if (!newUsers.has(userId)) {
+        messageApi.value?.warning(`玩家 ${name} 离开了房间`);
+      }
+    }
+  });
+
   return {
+    disconnect,
     profile,
     battles,
     battleStaticData,
@@ -1557,6 +1718,8 @@ export const useAppStore = defineStore('app', () => {
     spectate,
     startBattle,
     quickFail,
+    resetBattle,
+    setSlotOccupant,
     updateRoomOptions,
     sendContinuousInputFrame,
     previewFaceAngle,
@@ -1565,5 +1728,6 @@ export const useAppStore = defineStore('app', () => {
     recordStatusIconLoadFailure,
     submitRoomPassword,
     cancelRoomPasswordPrompt,
+    setMessageApi,
   };
 });

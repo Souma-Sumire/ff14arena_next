@@ -9,7 +9,7 @@ export interface AppVersionConfig {
   changelog: AppChangelogEntry[];
 }
 
-const APP_VERSION_CONFIG_URL = '/app-version.json';
+const APP_VERSION_CONFIG_URL = './app-version.json';
 const APP_VERSION_STORAGE_KEY = 'ff14arena.appVersion';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
